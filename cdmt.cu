@@ -95,8 +95,6 @@ struct chirp get_channel_chirp(double f0,double df,float dm,int nc)
   nexp=(int) ceil(log(c.nd2)/log(2.0));
 
   s=2.0*M_PI*dm/DMCONSTANT;
-  printf("Dispersion sweep: %f us, %d bins\n%d (%d+%d) bins discarded per FFT\n\
-",tdm,c.nbin,c.nd,c.nd1,c.nd2);
 
   // Number of channels per subband
   m=c.nbin/nc;
@@ -195,22 +193,6 @@ __global__ void unpack_and_padd(char *dbuf,int n,int nx,int ny,int i0,int m,cuff
   return;
 }
 
-__global__ void detect_and_transpose(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny,int nz,float *fbuf)
-{
-  int64_t i,j,k,l,m;
-  
-  i=blockIdx.x*blockDim.x+threadIdx.x;
-  j=blockIdx.y*blockDim.y+threadIdx.y;
-  k=blockIdx.z*blockDim.z+threadIdx.z;
-  if (i<nx && j<ny && k<nz) {
-    m=i+nx*(j+ny*k);
-    l=ny*i+(ny-j-1)+nx*ny*k;
-    fbuf[l]=sqrt(cp1[m].x*cp1[m].x+cp1[m].y*cp1[m].y+cp2[m].x*cp2[m].x+cp2[m].y*cp2[m].y);
-  }
-
-  return;
-}
-
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny)
 {
   int64_t i,j,k,l,m;
@@ -251,7 +233,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
   k=blockIdx.z*blockDim.z+threadIdx.z;
   if (i<nx && j<ny && k<nz) {
     m=i+nx*(j+ny*k);
-    //    l=ny*i+(ny-j-1)+nx*ny*k;
+
     // Time index
     ii=i+(nx-i0-i1)*k-i0;
 
@@ -260,7 +242,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 
     // Array index
     l=jj+ny*ii;
-    //    if (ii>=0 && ii<n && i>=i0 && i<=nx-i1)
+
     if (i>=i0 && i<=nx-i1 && ii>=0 && ii<n)
       fbuf[l]=sqrt(cp1[m].x*cp1[m].x+cp1[m].y*cp1[m].y+cp2[m].x*cp2[m].x+cp2[m].y*cp2[m].y);
   }
@@ -271,8 +253,9 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 int main(int argc,char *argv[])
 {
   int nsamp,nx,ny,nz,mx,my,mz,m,nchan=8;
+  int iblock,nread;
   char *header,*hbuf,*dbuf;
-  FILE *file;
+  FILE *file,*ofile;
   float *fbuf,*dfbuf;
   cufftComplex *cp1,*cp2,*dc;
   cufftHandle ftc2cf,ftc2cb;
@@ -285,6 +268,7 @@ int main(int argc,char *argv[])
 
   nsamp=195312.5;
   nsamp*=600;
+  nsamp=491520;
 
   // Data size
   nx=c.nbin;
@@ -293,118 +277,122 @@ int main(int argc,char *argv[])
   nz=(int) ceil(nsamp/(float) (m*ny));
   my=nchan;
   mx=nx/my;
-  //  mz=(int) ceil(nsamp/(float) (mx*my));
   mz=nz;
   printf("%dx%dx%d %dx%dx%d %d\n",nx,ny,nz,mx,my,mz,m);
-  
-  // Allocate device memory for chirp                                                                
-  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nx));
-  printf("dc: %d\n",sizeof(cufftComplex)*nx);
-  // Copy chirp to device                                                                            
-  checkCudaErrors(cudaMemcpy(dc,c.c,sizeof(cufftComplex)*nx,cudaMemcpyHostToDevice));
-
-  // Allocate memory for redigitized output and header
-  header=(char *) malloc(sizeof(char)*HEADERSIZE);
-  hbuf=(char *) malloc(sizeof(char)*4*nsamp);
-  checkCudaErrors(cudaMalloc((void **) &dbuf,sizeof(char)*4*nsamp));
-  printf("dbuf: %d\n",sizeof(char)*4*nsamp);
-
-  // Read file and buffer
-  file=fopen("last600s.dada","r");
-  fread(header,sizeof(char),HEADERSIZE,file);
-  fread(hbuf,sizeof(char),4*nsamp,file);
-  fclose(file);
-
-  // Copy buffer to device
-  checkCudaErrors(cudaMemcpy(dbuf,hbuf,sizeof(char)*4*nsamp,cudaMemcpyHostToDevice));
 
   // Allocate memory for complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nx*ny*nz));
   checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nx*ny*nz));
 
-  printf("cp1: %d\n",sizeof(cufftComplex)*nx*ny*nz);
-  printf("cp2: %d\n",sizeof(cufftComplex)*nx*ny*nz);
+  // Allocate device memory for chirp                                                                
+  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nx));
 
-  // Unpack data and padd data
-  blocksize.x=32;
-  blocksize.y=32;
-  blocksize.z=1;
-  gridsize.x=nx/blocksize.x+1;
-  gridsize.y=nz/blocksize.y+1;
-  gridsize.z=1;
-  unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nsamp,nx,nz,c.nd1,m,cp1,cp2);
+  // Allocate memory for redigitized output and header
+  header=(char *) malloc(sizeof(char)*HEADERSIZE);
+  hbuf=(char *) malloc(sizeof(char)*4*nsamp);
+  checkCudaErrors(cudaMalloc((void **) &dbuf,sizeof(char)*4*nsamp));
+
+  // Allocate output buffers
+  fbuf=(float *) malloc(sizeof(float)*nsamp);
+  checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp));
 
   // Generate FFT plan (batch in-place forward FFT)
   idist=nx;  odist=nx;  iembed=nx;  oembed=nx;  istride=1;  ostride=1;
   checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,ny*nz));
 
-  // Perform FFTs
-  checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
-  checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_FORWARD));
-
-  // Swap spectrum halves for large FFTs
-  blocksize.x=32;
-  blocksize.y=32;
-  blocksize.z=1;
-  gridsize.x=mx*my/blocksize.x+1;
-  gridsize.y=mz/blocksize.y+1;
-  gridsize.z=1;
-  swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mx*my,mz);
-
-  // Perform complex multiplication of FFT'ed data with chirp (in place)                             
-  blocksize.x=32;
-  blocksize.y=32;
-  blocksize.z=1;
-  gridsize.x=nx/blocksize.x+1;
-  gridsize.y=nz/blocksize.y+1;
-  gridsize.z=1;
-  PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nx,nz,1.0/(float) nx);
-  PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nx,nz,1.0/(float) nx);
-
-  // Swap spectrum halves for small FFTs
-  blocksize.x=32;
-  blocksize.y=32;
-  blocksize.z=1;
-  gridsize.x=mx/blocksize.x+1;
-  gridsize.y=my*mz/blocksize.y+1;
-  gridsize.z=1;
-  swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mx,my*mz);
-
   // Generate FFT plan (batch in-place backward FFT)
   idist=mx;  odist=mx;  iembed=mx;  oembed=mx;  istride=1;  ostride=1;
   checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,my*mz));
 
-  // Perform FFTs
-  checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
-  checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
+  // Copy chirp to device                                                                            
+  checkCudaErrors(cudaMemcpy(dc,c.c,sizeof(cufftComplex)*nx,cudaMemcpyHostToDevice));
 
-  // Allocate buffer
-  fbuf=(float *) malloc(sizeof(float)*nsamp);
-  checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp));
-
-  printf("dbuf: %d\n",sizeof(float)*nsamp);
-
-  blocksize.x=32;
-  blocksize.y=32;
-  blocksize.z=1;
-  gridsize.x=mx/blocksize.x+1;
-  gridsize.y=my/blocksize.y+1;
-  gridsize.z=mz/blocksize.z+1;
-  printf("Grids: %dx%dx%d; Blocks: %dx%dx%d\n",gridsize.x,gridsize.y,gridsize.z,blocksize.x,blocksize.y,blocksize.z);
-
-  // Detect data
-  printf("%d %d %d %d\n",mx,c.nd1/my,c.nd2/my,nsamp/my);
-  transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mx,my,mz,c.nd1/my,c.nd2/my,nsamp/my,dfbuf);
-
-  // Copy buffer to host
-  checkCudaErrors(cudaMemcpy(fbuf,dfbuf,sizeof(float)*nsamp,cudaMemcpyDeviceToHost));
-
+  // Read fil file header and dump in output file
   file=fopen("header.fil","r");
   fread(header,sizeof(char),351,file);
   fclose(file);
-  file=fopen("test.fil","w");
-  fwrite(header,sizeof(char),351,file);
-  fwrite(fbuf,sizeof(float),nsamp,file);
+  ofile=fopen("test.fil","w");
+  fwrite(header,sizeof(char),351,ofile);
+
+  // Read file and buffer
+  file=fopen("single_subband.dada","r");
+  fread(header,sizeof(char),HEADERSIZE,file);
+
+  // Loop over input file contents
+  for (iblock=0;;iblock++) {
+    nread=fread(hbuf,sizeof(char),4*nsamp,file)/4;
+    printf("%d %d %d\n",iblock,nread,4*nsamp);
+    if (nread==0)
+      break;
+
+    // Copy buffer to device
+    checkCudaErrors(cudaMemcpy(dbuf,hbuf,sizeof(char)*4*nread,cudaMemcpyHostToDevice));
+
+    // Unpack data and padd data
+    blocksize.x=32;
+    blocksize.y=32;
+    blocksize.z=1;
+    gridsize.x=nx/blocksize.x+1;
+    gridsize.y=nz/blocksize.y+1;
+    gridsize.z=1;
+    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nx,nz,c.nd1,m,cp1,cp2);
+    
+    // Perform FFTs
+    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
+    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_FORWARD));
+    
+    // Swap spectrum halves for large FFTs
+    blocksize.x=32;
+    blocksize.y=32;
+    blocksize.z=1;
+    gridsize.x=mx*my/blocksize.x+1;
+    gridsize.y=mz/blocksize.y+1;
+    gridsize.z=1;
+    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mx*my,mz);
+    
+    // Perform complex multiplication of FFT'ed data with chirp (in place)                             
+    blocksize.x=32;
+    blocksize.y=32;
+    blocksize.z=1;
+    gridsize.x=nx/blocksize.x+1;
+    gridsize.y=nz/blocksize.y+1;
+    gridsize.z=1;
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nx,nz,1.0/(float) nx);
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nx,nz,1.0/(float) nx);
+    
+    // Swap spectrum halves for small FFTs
+    blocksize.x=32;
+    blocksize.y=32;
+    blocksize.z=1;
+    gridsize.x=mx/blocksize.x+1;
+    gridsize.y=my*mz/blocksize.y+1;
+    gridsize.z=1;
+    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mx,my*mz);
+    
+    // Perform FFTs
+    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
+    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
+    
+    // Detect data
+    blocksize.x=32;
+    blocksize.y=32;
+    blocksize.z=1;
+    gridsize.x=mx/blocksize.x+1;
+    gridsize.y=my/blocksize.y+1;
+    gridsize.z=mz/blocksize.z+1;
+    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mx,my,mz,c.nd1/my,c.nd2/my,nread/my,dfbuf);
+    
+    // Copy buffer to host
+    checkCudaErrors(cudaMemcpy(fbuf,dfbuf,sizeof(float)*nread,cudaMemcpyDeviceToHost));
+    
+    // Write buffer
+    fwrite(fbuf,sizeof(float),nread,ofile);
+
+    break;
+  }
+
+  // Close files
+  fclose(ofile);
   fclose(file);
 
   // Free
