@@ -84,14 +84,15 @@ struct chirp get_channel_chirp(double f0,double df,float dm,int nc)
   c.nd=(int) floor(tdm*df);
   //  c.nd=c.nd1+c.nd2;                                                         
   nexp=(int) ceil(log(c.nd)/log(2.0))+1;
-  //////////////////// HARDCODED 512k bins //////////////////////////           
-  nexp=19;                                                                      
-  //  c.nd1=16384;                                                                  
-  //  c.nd2=16384;                                                                  
-  c.nd1=65536;
-  c.nd2=65536;
+  //////////////////// HARDCODED DISPERSION KERNEL //////////////////////////           
+  nexp=19;
+  c.nd1=16384;                                                                  
+  c.nd2=16384;                                                                  
+  //c.nd1=65536;
+  //  c.nd2=65536;
   c.nd=c.nd1+c.nd2;                                                             
   c.nbin=(int) pow(2.0,nexp);
+  nexp=(int) ceil(log(c.nd2)/log(2.0));
 
   s=2.0*M_PI*dm/DMCONSTANT;
   printf("Dispersion sweep: %f us, %d bins\n%d (%d+%d) bins discarded per FFT\n\
@@ -269,7 +270,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 
 int main(int argc,char *argv[])
 {
-  int nsamp=16000000,nx,ny,nz,mx,my,mz,m;
+  int nsamp,nx,ny,nz,mx,my,mz,m,nchan=8;
   char *header,*hbuf,*dbuf;
   FILE *file;
   float *fbuf,*dfbuf;
@@ -280,18 +281,17 @@ int main(int argc,char *argv[])
   struct chirp c;
 
   // Compute chirp
-  c=get_channel_chirp(135.0,0.1953125,100.0,8);
-  
+  c=get_channel_chirp(119.7265625,0.1953125,39.659298,nchan);
+
   nsamp=195312.5;
   nsamp*=600;
-  //  c=get_channel_chirp(135.0,0.1953125,100.0,8);
 
   // Data size
   nx=c.nbin;
   m=c.nbin-c.nd;
   ny=1;
   nz=(int) ceil(nsamp/(float) (m*ny));
-  my=8;
+  my=nchan;
   mx=nx/my;
   //  mz=(int) ceil(nsamp/(float) (mx*my));
   mz=nz;
@@ -299,7 +299,7 @@ int main(int argc,char *argv[])
   
   // Allocate device memory for chirp                                                                
   checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nx));
-
+  printf("dc: %d\n",sizeof(cufftComplex)*nx);
   // Copy chirp to device                                                                            
   checkCudaErrors(cudaMemcpy(dc,c.c,sizeof(cufftComplex)*nx,cudaMemcpyHostToDevice));
 
@@ -307,9 +307,10 @@ int main(int argc,char *argv[])
   header=(char *) malloc(sizeof(char)*HEADERSIZE);
   hbuf=(char *) malloc(sizeof(char)*4*nsamp);
   checkCudaErrors(cudaMalloc((void **) &dbuf,sizeof(char)*4*nsamp));
+  printf("dbuf: %d\n",sizeof(char)*4*nsamp);
 
   // Read file and buffer
-  file=fopen("test.dada","r");
+  file=fopen("last600s.dada","r");
   fread(header,sizeof(char),HEADERSIZE,file);
   fread(hbuf,sizeof(char),4*nsamp,file);
   fclose(file);
@@ -320,6 +321,9 @@ int main(int argc,char *argv[])
   // Allocate memory for complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nx*ny*nz));
   checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nx*ny*nz));
+
+  printf("cp1: %d\n",sizeof(cufftComplex)*nx*ny*nz);
+  printf("cp2: %d\n",sizeof(cufftComplex)*nx*ny*nz);
 
   // Unpack data and padd data
   blocksize.x=32;
@@ -377,6 +381,8 @@ int main(int argc,char *argv[])
   // Allocate buffer
   fbuf=(float *) malloc(sizeof(float)*nsamp);
   checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp));
+
+  printf("dbuf: %d\n",sizeof(float)*nsamp);
 
   blocksize.x=32;
   blocksize.y=32;
