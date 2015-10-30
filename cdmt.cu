@@ -43,6 +43,7 @@ void get_channel_chirp(double f0,double df,float dm,int nchan,int nbin,cufftComp
   return;
 }
 
+// Scale cufftComplex 
 static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float s)
 {
   cufftComplex c;
@@ -51,6 +52,7 @@ static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float
   return c;
 }
 
+// Complex multiplication
 static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftComplex b)
 {
   cufftComplex c;
@@ -72,31 +74,40 @@ static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,
   }
 }
 
-__global__ void unpack_and_padd(char *dbuf,int n,int nx,int ny,int i0,int m,cufftComplex *cp1,cufftComplex *cp2)
+// Unpack the input buffer and generate complex timeseries. The output
+// timeseries are padded with noverlap samples on either side for the
+// convolution.
+__global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
 {
-  int64_t i,j,k,l;
+  int64_t ibin,ifft,isamp,idx;
 
-  i=blockIdx.x*blockDim.x+threadIdx.x;
-  j=blockIdx.y*blockDim.y+threadIdx.y;
-  if (i<nx && j<ny) {
-    k=i+nx*j;
-    l=i+m*j-i0;
-    if (l<0 || l>=n) {
-      cp1[k].x=0.0;
-      cp1[k].y=0.0;
-      cp2[k].x=0.0;
-      cp2[k].y=0.0;
+  // Indices of input data
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+
+  // Only compute valid threads
+  if (ibin<nbin && ifft<nfft) {
+    idx=ibin+nbin*ifft;
+    isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
+    if (isamp<0 || isamp>=nsamp) {
+      cp1[idx].x=0.0;
+      cp1[idx].y=0.0;
+      cp2[idx].x=0.0;
+      cp2[idx].y=0.0;
     } else {
-      cp1[k].x=(float) dbuf[4*l];
-      cp1[k].y=(float) dbuf[4*l+1];
-      cp2[k].x=(float) dbuf[4*l+2];
-      cp2[k].y=(float) dbuf[4*l+3];
+      cp1[idx].x=(float) dbuf[4*isamp];
+      cp1[idx].y=(float) dbuf[4*isamp+1];
+      cp2[idx].x=(float) dbuf[4*isamp+2];
+      cp2[idx].y=(float) dbuf[4*isamp+3];
     }
   }
 
   return;
 }
 
+// Since complex-to-complex FFTs put the center frequency at bin zero
+// in the frequency domain, the two halves of the spectrum need to be
+// swapped.
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny)
 {
   int64_t i,j,k,l,m;
@@ -128,27 +139,30 @@ __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,
   return;
 }
 
-__global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny,int nz,int i0,int i1,int n,float *fbuf)
+// After the segmented FFT the data is in a cube of nbin by nchan by
+// nfft, where nbin and nfft are the time indices. Here we rearrange
+// the 3D data cube into a 2D array of frequency and time, while also
+// removing the overlap regions and detecting (generating Stokes I).
+__global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,int nbin,int nchan,int nfft,int noverlap,int nsamp,float *fbuf)
 {
-  int64_t i,j,k,l,m,ii,jj;
+  int64_t ibin,ichan,ifft,isamp,idx1,idx2;
   
-  i=blockIdx.x*blockDim.x+threadIdx.x;
-  j=blockIdx.y*blockDim.y+threadIdx.y;
-  k=blockIdx.z*blockDim.z+threadIdx.z;
-  if (i<nx && j<ny && k<nz) {
-    m=i+nx*(j+ny*k);
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ichan=blockIdx.y*blockDim.y+threadIdx.y;
+  ifft=blockIdx.z*blockDim.z+threadIdx.z;
+  if (ibin<nbin && ichan<nchan && ifft<nfft) {
+    // Padded array index
+    idx1=ibin+nbin*(ichan+nchan*ifft);
 
     // Time index
-    ii=i+(nx-i0-i1)*k-i0;
+    isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
 
-    // Frequency index
-    jj=ny-j-1;
+    // Output array index
+    idx2=(nchan-ichan-1)+nchan*isamp;
 
-    // Array index
-    l=jj+ny*ii;
-
-    if (i>=i0 && i<=nx-i1 && ii>=0 && ii<n)
-      fbuf[l]=sqrt(cp1[m].x*cp1[m].x+cp1[m].y*cp1[m].y+cp2[m].x*cp2[m].x+cp2[m].y*cp2[m].y);
+    // Select data points from valid region
+    if (ibin>=noverlap && ibin<=nbin-noverlap && isamp>=0 && isamp<nsamp)
+      fbuf[idx2]=sqrt(cp1[idx1].x*cp1[idx1].x+cp1[idx1].y*cp1[idx1].y+cp2[idx1].x*cp2[idx1].x+cp2[idx1].y*cp2[idx1].y);
   }
 
   return;
@@ -156,7 +170,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 
 int main(int argc,char *argv[])
 {
-  int nsamp,nz,mx,my,mz,m,nchan=8,nbin=65536,noverlap=2048;
+  int nsamp,nfft,mbin,mfft,nvalid,nchan=8,nbin=65536,noverlap=2048;
   int iblock,nread;
   char *header,*hbuf,*dbuf;
   FILE *file,*ofile;
@@ -177,16 +191,15 @@ int main(int argc,char *argv[])
   nsamp=491520*20;
 
   // Data size
-  m=nbin-2*noverlap;
-  nz=(int) ceil(nsamp/(float) m);
-  my=nchan;
-  mx=nbin/my;
-  mz=nz;
-  printf("%dx%d %dx%dx%d %d\n",nbin,nz,mx,my,mz,m);
+  nvalid=nbin-2*noverlap;
+  nfft=(int) ceil(nsamp/(float) nvalid);
+  mbin=nbin/nchan;
+  mfft=nfft;
+  printf("%dx%d %dx%dx%d %d\n",nbin,nfft,mbin,nchan,mfft,nvalid);
 
   // Allocate memory for complex timeseries
-  checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nz));
-  checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nz));
+  checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft));
+  checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nfft));
 
   // Allocate device memory for chirp                                                                
   checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin));
@@ -202,11 +215,11 @@ int main(int argc,char *argv[])
 
   // Generate FFT plan (batch in-place forward FFT)
   idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nz));
+  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft));
 
   // Generate FFT plan (batch in-place backward FFT)
-  idist=mx;  odist=mx;  iembed=mx;  oembed=mx;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,my*mz));
+  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*mfft));
 
   // Copy chirp to device                                                                            
   checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin,cudaMemcpyHostToDevice));
@@ -237,9 +250,9 @@ int main(int argc,char *argv[])
     blocksize.y=32;
     blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1;
-    gridsize.y=nz/blocksize.y+1;
+    gridsize.y=nfft/blocksize.y+1;
     gridsize.z=1;
-    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nbin,nz,noverlap,m,cp1,cp2);
+    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nbin,nfft,noverlap,cp1,cp2);
     
     // Perform FFTs
     checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
@@ -249,29 +262,29 @@ int main(int argc,char *argv[])
     blocksize.x=32;
     blocksize.y=32;
     blocksize.z=1;
-    gridsize.x=mx*my/blocksize.x+1;
-    gridsize.y=mz/blocksize.y+1;
+    gridsize.x=mbin*nchan/blocksize.x+1;
+    gridsize.y=mfft/blocksize.y+1;
     gridsize.z=1;
-    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mx*my,mz);
+    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mbin*nchan,mfft);
     
     // Perform complex multiplication of FFT'ed data with chirp (in place)                             
     blocksize.x=32;
     blocksize.y=32;
     blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1;
-    gridsize.y=nz/blocksize.y+1;
+    gridsize.y=nfft/blocksize.y+1;
     gridsize.z=1;
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nbin,nz,1.0/(float) nbin);
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nbin,nz,1.0/(float) nbin);
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nbin,nfft,1.0/(float) nbin);
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nbin,nfft,1.0/(float) nbin);
     
     // Swap spectrum halves for small FFTs
     blocksize.x=32;
     blocksize.y=32;
     blocksize.z=1;
-    gridsize.x=mx/blocksize.x+1;
-    gridsize.y=my*mz/blocksize.y+1;
+    gridsize.x=mbin/blocksize.x+1;
+    gridsize.y=nchan*mfft/blocksize.y+1;
     gridsize.z=1;
-    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mx,my*mz);
+    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan*mfft);
     
     // Perform FFTs
     checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
@@ -281,10 +294,10 @@ int main(int argc,char *argv[])
     blocksize.x=32;
     blocksize.y=32;
     blocksize.z=1;
-    gridsize.x=mx/blocksize.x+1;
-    gridsize.y=my/blocksize.y+1;
-    gridsize.z=mz/blocksize.z+1;
-    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mx,my,mz,noverlap/my,noverlap/my,nread/my,dfbuf);
+    gridsize.x=mbin/blocksize.x+1;
+    gridsize.y=nchan/blocksize.y+1;
+    gridsize.z=mfft/blocksize.z+1;
+    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan,mfft,noverlap/nchan,nread/nchan,dfbuf);
     
     // Copy buffer to host
     checkCudaErrors(cudaMemcpy(fbuf,dfbuf,sizeof(float)*nread,cudaMemcpyDeviceToHost));
