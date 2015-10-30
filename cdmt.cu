@@ -10,103 +10,23 @@
 #define HEADERSIZE 4096
 #define DMCONSTANT 2.41e-10
 
-struct chirp {
-  int nbin,nd1,nd2,nd;
-  cufftComplex *c;
-};
-
 // Compute chirp                                                                
-struct chirp get_chirp(double f0,double df,float dm)
+void get_channel_chirp(double f0,double df,float dm,int nchan,int nbin,cufftComplex *c)
 {
-  int i,nexp;
-  float tdm;
-  float s,rt,t,f,td1,td2;
-  struct chirp c;
+  int i,k,l,m;
+  float s,rt,t,f,fc0,dfc;
 
-  // Compute dispersion sweep
-  td1=dm*(pow(f0,-2)-pow(f0+0.5*df,-2))/DMCONSTANT;
-  td2=dm*(pow(f0-0.5*df,-2)-pow(f0,-2))/DMCONSTANT;
-  c.nd1=(int) floor(td1*df);
-  c.nd2=(int) floor(td2*df);
-  tdm=dm*(pow(f0-0.5*df,-2)-pow(f0+0.5*df,-2))/DMCONSTANT;
-  c.nd=(int) floor(tdm*df);
-  //  c.nd=c.nd1+c.nd2;                                                         
-  nexp=(int) ceil(log(c.nd)/log(2.0))+1;
-  //////////////////// HARDCODED 512k bins //////////////////////////           
-  nexp=19;                                                                      
-  //  c.nd1=16384;                                                                  
-  //  c.nd2=16384;                                                                  
-  c.nd1=65536;
-  c.nd2=65536;
-  c.nd=c.nd1+c.nd2;                                                             
-  c.nbin=(int) pow(2.0,nexp);
-
-  s=2.0*M_PI*dm/DMCONSTANT;
-  printf("Dispersion sweep: %f us, %d bins\n%d (%d+%d) bins discarded per FFT\n\
-",tdm,c.nbin,c.nd,c.nd1,c.nd2);
-
-  // Allocate                                                                   
-  c.c=(cufftComplex *) malloc(sizeof(cufftComplex)*c.nbin);
-
-  // Compute chirp                                                              
-  for (i=0;i<c.nbin;i++) {
-    //    if (i<c.nbin/2)
-    //      j=i+c.nbin/2;
-    //    else
-    //      j=i-c.nbin/2;
-
-    f=-0.5*df+df*(float) i/(float) (c.nbin-1);
-
-    rt=-f*f*s/((f0+f)*f0*f0);
-    t=1.0/sqrt(1.0+pow((f/(0.47*df)),80));
-
-    c.c[i].x=cos(rt)*t;
-    c.c[i].y=sin(rt)*t;
-  }
-
-  return c;
-}
-
-// Compute chirp                                                                
-struct chirp get_channel_chirp(double f0,double df,float dm,int nc)
-{
-  int i,k,l,m,nexp;
-  float tdm;
-  float s,rt,t,f,td1,td2,fc0,dfc;
-  struct chirp c;
-
-  // Compute dispersion sweep
-  td1=dm*(pow(f0,-2)-pow(f0+0.5*df,-2))/DMCONSTANT;
-  td2=dm*(pow(f0-0.5*df,-2)-pow(f0,-2))/DMCONSTANT;
-  c.nd1=(int) floor(td1*df);
-  c.nd2=(int) floor(td2*df);
-  tdm=dm*(pow(f0-0.5*df,-2)-pow(f0+0.5*df,-2))/DMCONSTANT;
-  c.nd=(int) floor(tdm*df);
-  //  c.nd=c.nd1+c.nd2;                                                         
-  nexp=(int) ceil(log(c.nd)/log(2.0))+1;
-  //////////////////// HARDCODED DISPERSION KERNEL //////////////////////////           
-  nexp=19;
-  c.nd1=16384;                                                                  
-  c.nd2=16384;                                                                  
-  //c.nd1=65536;
-  //  c.nd2=65536;
-  c.nd=c.nd1+c.nd2;                                                             
-  c.nbin=(int) pow(2.0,nexp);
-  nexp=(int) ceil(log(c.nd2)/log(2.0));
-
+  // Main constant
   s=2.0*M_PI*dm/DMCONSTANT;
 
   // Number of channels per subband
-  m=c.nbin/nc;
+  m=nbin/nchan;
 
-  // Allocate                                                                   
-  c.c=(cufftComplex *) malloc(sizeof(cufftComplex)*c.nbin);
-
-  dfc=df/nc;
+  dfc=df/nchan;
 
   // Loop over subbands
-  for (k=0;k<nc;k++) {
-    fc0=f0-0.5*df+df*(float) k/(float) nc+0.5*df/(float) nc;
+  for (k=0;k<nchan;k++) {
+    fc0=f0-0.5*df+df*(float) k/(float) nchan+0.5*df/(float) nchan;
     for (i=0;i<m;i++) {
       f=-0.5*dfc+dfc*(float) i/(float) (m-1);
 
@@ -115,28 +35,12 @@ struct chirp get_channel_chirp(double f0,double df,float dm,int nc)
 
       l=i+k*m;
       
-      c.c[l].x=cos(rt)*t;
-      c.c[l].y=sin(rt)*t;
+      c[l].x=cos(rt)*t;
+      c[l].y=sin(rt)*t;
     }
   }
-  /*
-  // Compute chirp                                                              
-  for (i=0;i<c.nbin;i++) {
-    if (i<c.nbin/2)
-      j=i+c.nbin/2;
-    else
-      j=i-c.nbin/2;
 
-    f=-0.5*df+df*(float) j/(float) (c.nbin-1);
-
-    rt=-f*f*s/((f0+f)*f0*f0);
-    t=1.0/sqrt(1.0+pow((f/(0.47*df)),80));
-
-    c.c[i].x=cos(rt)*t;
-    c.c[i].y=sin(rt)*t;
-  }
-  */
-  return c;
+  return;
 }
 
 static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float s)
@@ -252,40 +156,40 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 
 int main(int argc,char *argv[])
 {
-  int nsamp,nx,ny,nz,mx,my,mz,m,nchan=8;
+  int nsamp,nz,mx,my,mz,m,nchan=8,nbin=65536,noverlap=2048;
   int iblock,nread;
   char *header,*hbuf,*dbuf;
   FILE *file,*ofile;
   float *fbuf,*dfbuf;
-  cufftComplex *cp1,*cp2,*dc;
+  cufftComplex *cp1,*cp2,*dc,*c;
   cufftHandle ftc2cf,ftc2cb;
   int idist,odist,iembed,oembed,istride,ostride;
   dim3 blocksize,gridsize;
-  struct chirp c;
+
+  c=(cufftComplex *) malloc(sizeof(cufftComplex)*nbin);
 
   // Compute chirp
-  c=get_channel_chirp(119.7265625,0.1953125,39.659298,nchan);
+  //get_channel_chirp(119.7265625,0.1953125,39.659298,nchan,nbin,c);
+  get_channel_chirp(135.0,0.1953125,100.0,nchan,nbin,c);
 
   nsamp=195312.5;
   nsamp*=600;
-  nsamp=491520;
+  nsamp=491520*20;
 
   // Data size
-  nx=c.nbin;
-  m=c.nbin-c.nd;
-  ny=1;
-  nz=(int) ceil(nsamp/(float) (m*ny));
+  m=nbin-2*noverlap;
+  nz=(int) ceil(nsamp/(float) m);
   my=nchan;
-  mx=nx/my;
+  mx=nbin/my;
   mz=nz;
-  printf("%dx%dx%d %dx%dx%d %d\n",nx,ny,nz,mx,my,mz,m);
+  printf("%dx%d %dx%dx%d %d\n",nbin,nz,mx,my,mz,m);
 
   // Allocate memory for complex timeseries
-  checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nx*ny*nz));
-  checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nx*ny*nz));
+  checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nz));
+  checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nz));
 
   // Allocate device memory for chirp                                                                
-  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nx));
+  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin));
 
   // Allocate memory for redigitized output and header
   header=(char *) malloc(sizeof(char)*HEADERSIZE);
@@ -297,15 +201,15 @@ int main(int argc,char *argv[])
   checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp));
 
   // Generate FFT plan (batch in-place forward FFT)
-  idist=nx;  odist=nx;  iembed=nx;  oembed=nx;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,ny*nz));
+  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nz));
 
   // Generate FFT plan (batch in-place backward FFT)
   idist=mx;  odist=mx;  iembed=mx;  oembed=mx;  istride=1;  ostride=1;
   checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mx,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,my*mz));
 
   // Copy chirp to device                                                                            
-  checkCudaErrors(cudaMemcpy(dc,c.c,sizeof(cufftComplex)*nx,cudaMemcpyHostToDevice));
+  checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin,cudaMemcpyHostToDevice));
 
   // Read fil file header and dump in output file
   file=fopen("header.fil","r");
@@ -315,7 +219,7 @@ int main(int argc,char *argv[])
   fwrite(header,sizeof(char),351,ofile);
 
   // Read file and buffer
-  file=fopen("single_subband.dada","r");
+  file=fopen("test.dada","r");
   fread(header,sizeof(char),HEADERSIZE,file);
 
   // Loop over input file contents
@@ -332,10 +236,10 @@ int main(int argc,char *argv[])
     blocksize.x=32;
     blocksize.y=32;
     blocksize.z=1;
-    gridsize.x=nx/blocksize.x+1;
+    gridsize.x=nbin/blocksize.x+1;
     gridsize.y=nz/blocksize.y+1;
     gridsize.z=1;
-    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nx,nz,c.nd1,m,cp1,cp2);
+    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nbin,nz,noverlap,m,cp1,cp2);
     
     // Perform FFTs
     checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
@@ -354,11 +258,11 @@ int main(int argc,char *argv[])
     blocksize.x=32;
     blocksize.y=32;
     blocksize.z=1;
-    gridsize.x=nx/blocksize.x+1;
+    gridsize.x=nbin/blocksize.x+1;
     gridsize.y=nz/blocksize.y+1;
     gridsize.z=1;
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nx,nz,1.0/(float) nx);
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nx,nz,1.0/(float) nx);
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nbin,nz,1.0/(float) nbin);
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nbin,nz,1.0/(float) nbin);
     
     // Swap spectrum halves for small FFTs
     blocksize.x=32;
@@ -380,7 +284,7 @@ int main(int argc,char *argv[])
     gridsize.x=mx/blocksize.x+1;
     gridsize.y=my/blocksize.y+1;
     gridsize.z=mz/blocksize.z+1;
-    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mx,my,mz,c.nd1/my,c.nd2/my,nread/my,dfbuf);
+    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mx,my,mz,noverlap/my,noverlap/my,nread/my,dfbuf);
     
     // Copy buffer to host
     checkCudaErrors(cudaMemcpy(fbuf,dfbuf,sizeof(float)*nread,cudaMemcpyDeviceToHost));
@@ -388,7 +292,6 @@ int main(int argc,char *argv[])
     // Write buffer
     fwrite(fbuf,sizeof(float),nread,ofile);
 
-    break;
   }
 
   // Close files
@@ -399,7 +302,7 @@ int main(int argc,char *argv[])
   free(header);
   free(hbuf);
   free(fbuf);
-  free(c.c);
+  free(c);
   cudaFree(dbuf);
   cudaFree(dfbuf);
   cudaFree(cp1);
