@@ -212,11 +212,11 @@ int main(int argc,char *argv[])
 
   // Data size
   nvalid=nbin-2*noverlap;
-  nsamp=100*nvalid;
+  nsamp=200*nvalid;
   nfft=(int) ceil(nsamp/(float) nvalid);
   mbin=nbin/nchan;
 
-  printf("nbin: %d nfft: %d nsub: %d mbin: %d nchan: %d\n",nbin,nfft,nsub,mbin,nchan);
+  printf("nbin: %d nfft: %d nsub: %d mbin: %d nchan: %d nsamp: %d nvalid: %d\n",nbin,nfft,nsub,mbin,nchan,nsamp,nvalid);
 
   // Allocate memory for complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
@@ -259,7 +259,6 @@ int main(int argc,char *argv[])
   // Loop over input file contents
   for (iblock=0;;iblock++) {
     nread=fread(hbuf,sizeof(char),4*nsamp*nsub,file)/(4*nsub);
-    printf("%d %d %d\n",iblock,nread,nsamp);
     if (nread==0)
       break;
 

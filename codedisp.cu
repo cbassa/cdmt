@@ -125,12 +125,10 @@ struct chirp get_chirp(double f0,double df,float dm)
   //  c.nd=c.nd1+c.nd2;
   nexp=(int) ceil(log(c.nd)/log(2.0))+1;
   //////////////////// HARDCODED 512k bins //////////////////////////
-  /*
-  nexp=19;
-  c.nd1=16384;
-  c.nd2=16384;
+  //  nexp=19;
+  //c.nd1=16384;
+  //c.nd2=16384;
   c.nd=c.nd1+c.nd2;
-  */
   c.nbin=(int) pow(2.0,nexp);
 
   s=2.0*M_PI*dm/DMCONSTANT;
