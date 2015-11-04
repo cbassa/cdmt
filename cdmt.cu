@@ -186,7 +186,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
       
       // Select data points from valid region
       if (ibin>=noverlap && ibin<=nbin-noverlap && isamp>=0 && isamp<nsamp)
-	fbuf[idx2]=sqrt(cp1[idx1].x*cp1[idx1].x+cp1[idx1].y*cp1[idx1].y+cp2[idx1].x*cp2[idx1].x+cp2[idx1].y*cp2[idx1].y);
+	fbuf[idx2]=cp1[idx1].x*cp1[idx1].x+cp1[idx1].y*cp1[idx1].y+cp2[idx1].x*cp2[idx1].x+cp2[idx1].y*cp2[idx1].y;
     }
   }
 
@@ -222,7 +222,7 @@ int main(int argc,char *argv[])
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
   checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nfft*nsub));
 
-  // Allocate device memory for chirp                                                                
+  // Allocate device memory for chirp
   checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin*nsub));
 
   // Allocate memory for redigitized output and header
@@ -242,7 +242,7 @@ int main(int argc,char *argv[])
   idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
   checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
 
-  // Copy chirp to device                                                                            
+  // Copy chirp to device
   checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin*nsub,cudaMemcpyHostToDevice));
 
   // Read fil file header and dump in output file
@@ -287,7 +287,7 @@ int main(int argc,char *argv[])
     gridsize.z=1;
     swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,nbin,nfft*nsub);
 
-    // Perform complex multiplication of FFT'ed data with chirp (in place)                             
+    // Perform complex multiplication of FFT'ed data with chirp (in place)
     blocksize.x=32;
     blocksize.y=32;
     blocksize.z=1;
