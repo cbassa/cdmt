@@ -30,6 +30,7 @@ static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftCo
 static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale);
 __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
+__global__ void compute_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c);
 void write_filterbank_header(struct header h,FILE *file);
 
 int main(int argc,char *argv[])
@@ -39,7 +40,7 @@ int main(int argc,char *argv[])
   char *header,*h5buf[4],*dh5buf[4];
   FILE *file[4],*ofile;
   float *fbuf,*dfbuf;
-  cufftComplex *cp1,*cp2,*dc,*c;
+  cufftComplex *cp1,*cp2,*dc;
   cufftHandle ftc2cf,ftc2cb;
   int idist,odist,iembed,oembed,istride,ostride;
   dim3 blocksize,gridsize;
@@ -58,12 +59,6 @@ int main(int argc,char *argv[])
   h5.nbit=32;
   h5.fch1=h5.fcen+0.5*h5.nsub*h5.bwchan-0.5*h5.bwchan/nchan;
   h5.foff=-fabs(h5.bwchan/nchan);
-
-  // Allocate chirp
-  c=(cufftComplex *) malloc(sizeof(cufftComplex)*nbin*nsub);
-
-  // Compute chirp
-  get_channel_chirp(h5.fcen,nsub*h5.bwchan,39.659298,nchan,nbin,nsub,c);
 
   // Data size
   nvalid=nbin-2*noverlap;
@@ -99,11 +94,13 @@ int main(int argc,char *argv[])
   idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
   checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
 
-  // Copy chirp to device
-  checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin*nsub,cudaMemcpyHostToDevice));
+  // Compute chirp
+  blocksize.x=32; blocksize.y=32; blocksize.z=1;
+  gridsize.x=nsub/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=1;
+  compute_chirp<<<gridsize,blocksize>>>(h5.fcen,nsub*h5.bwchan,39.659298,nchan,nbin,nsub,dc);
 
   // Open output file
-  ofile=fopen("fifo","w");
+  ofile=fopen("cdmt.fil","w");
 
   // Write filterbank header
   write_filterbank_header(h5,ofile);
@@ -184,7 +181,6 @@ int main(int argc,char *argv[])
     free(h5.rawfname[i]);
   }
   free(fbuf);
-  free(c);
   cudaFree(dfbuf);
   cudaFree(cp1);
   cudaFree(cp2);
@@ -345,58 +341,6 @@ struct header read_h5_header(char *fname)
   return h;
 }
 
-// Compute chirp
-void get_channel_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c)
-{
-  int ibin,ichan,isub,mbin,idx;
-  double s,rt,t,f,fsub,fchan,bwchan,bwsub;
-
-  // Main constant
-  s=2.0*M_PI*dm/DMCONSTANT;
-
-  // Number of channels per subband
-  mbin=nbin/nchan;
-
-  // Subband bandwidth
-  bwsub=bw/nsub;
-
-  // Channel bandwidth
-  bwchan=bw/(nchan*nsub);
-
-  // Loop over subbands
-  for (isub=0;isub<nsub;isub++) {
-    // Subband frequency
-    fsub=fcen-0.5*bw+bw*(float) isub/(float) nsub+0.5*bw/(float) nsub;
-
-    // Loop over channels
-    for (ichan=0;ichan<nchan;ichan++) {
-      // Channel frequency
-      fchan=fsub-0.5*bwsub+bwsub*(float) ichan/(float) nchan+0.5*bwsub/(float) nchan;
-      
-      // Loop over bins in channel
-      for (ibin=0;ibin<mbin;ibin++) {
-	// Bin frequency
-	f=-0.5*bwchan+bwchan*(float) ibin/(float) mbin+0.5*bwchan/(float) mbin;
-	
-	// Phase delay
-	rt=-f*f*s/((fchan+f)*fchan*fchan);
-
-	// Taper
-	t=1.0/sqrt(1.0+pow((f/(0.47*bwchan)),80));
-	
-	// Index
-	idx=ibin+ichan*mbin+isub*mbin*nchan;
-
-	// Chirp
-	c[idx].x=cos(rt)*t;
-	c[idx].y=sin(rt)*t;
-      }
-    }
-  }
-
-  return;
-}
-
 // Scale cufftComplex 
 static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float s)
 {
@@ -415,7 +359,7 @@ static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftCo
   return c;
 }
 
-// Pointwise complex multiplication (and scaling)                               
+// Pointwise complex multiplication (and scaling)
 static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale)
 {
   int i,j,k;
@@ -426,6 +370,56 @@ static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,
     k=i+nx*j;
     c[k]=ComplexScale(ComplexMul(a[k],b[i]),scale);
   }
+}
+
+__global__ void compute_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c)
+{
+  int ibin,ichan,isub,mbin,idx;
+  double s,rt,t,f,fsub,fchan,bwchan,bwsub;
+
+  // Main constant
+  s=2.0*M_PI*dm/DMCONSTANT;
+
+  // Number of channels per subband
+  mbin=nbin/nchan;
+
+  // Subband bandwidth
+  bwsub=bw/nsub;
+
+  // Channel bandwidth
+  bwchan=bw/(nchan*nsub);
+
+  // Indices of input data
+  isub=blockIdx.x*blockDim.x+threadIdx.x;
+  ichan=blockIdx.y*blockDim.y+threadIdx.y;
+
+  // Keep in range
+  if (isub<nsub && ichan<nchan) {
+    // Frequencies
+    fsub=fcen-0.5*bw+bw*(float) isub/(float) nsub+0.5*bw/(float) nsub;
+    fchan=fsub-0.5*bwsub+bwsub*(float) ichan/(float) nchan+0.5*bwsub/(float) nchan;
+      
+    // Loop over bins in channel
+    for (ibin=0;ibin<mbin;ibin++) {
+      // Bin frequency
+      f=-0.5*bwchan+bwchan*(float) ibin/(float) mbin+0.5*bwchan/(float) mbin;
+      
+      // Phase delay
+      rt=-f*f*s/((fchan+f)*fchan*fchan);
+      
+      // Taper
+      t=1.0/sqrt(1.0+pow((f/(0.47*bwchan)),80));
+      
+      // Index
+      idx=ibin+ichan*mbin+isub*mbin*nchan;
+      
+      // Chirp
+      c[idx].x=cos(rt)*t;
+      c[idx].y=sin(rt)*t;
+    }
+  }
+
+  return;
 }
 
 // Unpack the input buffer and generate complex timeseries. The output
@@ -528,7 +522,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
   return;
 }
 
-void send_string(char *string,FILE *file)
+void send_string(const char *string,FILE *file)
 {
   int len;
 
@@ -539,7 +533,7 @@ void send_string(char *string,FILE *file)
   return;
 }
 
-void send_float(char *string,float x,FILE *file)
+void send_float(const char *string,float x,FILE *file)
 {
   send_string(string,file);
   fwrite(&x,sizeof(float),1,file);
@@ -547,7 +541,7 @@ void send_float(char *string,float x,FILE *file)
   return;
 }
 
-void send_int(char *string,int x,FILE *file)
+void send_int(const char *string,int x,FILE *file)
 {
   send_string(string,file);
   fwrite(&x,sizeof(int),1,file);
@@ -555,7 +549,7 @@ void send_int(char *string,int x,FILE *file)
   return;
 }
 
-void send_double(char *string,double x,FILE *file)
+void send_double(const char *string,double x,FILE *file)
 {
   send_string(string,file);
   fwrite(&x,sizeof(double),1,file);

@@ -17,11 +17,10 @@ cdmt: cdmt.o
 cdmt.o: cdmt.cu
 	$(NVCC) $(CFLAGS) -o $@ -c $<
 
-skz.o: skz.cu
-	$(NVCC) $(CFLAGS) -o $@ -c $<
-
 codedisp: codedisp.cu
 	$(NVCC) $(CFLAGS) -o codedisp codedisp.cu $(LFLAGS)
+
+
 
 clean:
 	rm -f *.o
