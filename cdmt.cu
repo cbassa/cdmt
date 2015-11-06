@@ -6,11 +6,328 @@
 #include <cufft.h>
 #include <helper_functions.h>
 #include <helper_cuda.h>
+#include "hdf5.h"
 
 #define HEADERSIZE 4096
 #define DMCONSTANT 2.41e-10
 
-// Compute chirp                                                                
+struct header {
+  int64_t headersize,buffersize;
+  unsigned int nchan,nsamp,nbit,nif,nsub;
+  int machine_id,telescope_id,nbeam,ibeam,sumif;
+  double tstart,tsamp,fch1,foff,fcen,bwchan;
+  double src_raj,src_dej,az_start,za_start;
+  char source_name[80],ifstream[8],inpfile[80];
+  char *rawfname[4];
+};
+
+struct header read_h5_header(char *fname);
+void get_channel_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c);
+__global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,int nbin,int nchan,int nfft,int nsub,int noverlap,int nsamp,float *fbuf);
+static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float s);
+static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftComplex b);
+static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale);
+__global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
+__global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
+
+int main(int argc,char *argv[])
+{
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20;
+  int iblock,nread;
+  char *header,*hbuf,*dbuf;
+  FILE *file,*ofile;
+  float *fbuf,*dfbuf;
+  cufftComplex *cp1,*cp2,*dc,*c;
+  cufftHandle ftc2cf,ftc2cb;
+  int idist,odist,iembed,oembed,istride,ostride;
+  dim3 blocksize,gridsize;
+  struct header h5;
+  char filename[]="/data1/bassa/complex_voltage/J1810+1744_8bit/L243355_SAP000_B000_S1_P002_bf.h5";
+
+  // Read HDF5 header
+  h5=read_h5_header(filename);
+
+  // Set number of subbands
+  nsub=h5.nsub;
+
+  // Allocate chirp
+  c=(cufftComplex *) malloc(sizeof(cufftComplex)*nbin*nsub);
+
+  // Compute chirp
+  get_channel_chirp(h5.fcen,nsub*h5.bwchan,39.659298,nchan,nbin,nsub,c);
+
+  // Data size
+  nvalid=nbin-2*noverlap;
+  nsamp=200*nvalid;
+  nfft=(int) ceil(nsamp/(float) nvalid);
+  mbin=nbin/nchan;
+
+  printf("nbin: %d nfft: %d nsub: %d mbin: %d nchan: %d nsamp: %d nvalid: %d\n",nbin,nfft,nsub,mbin,nchan,nsamp,nvalid);
+
+  // Allocate memory for complex timeseries
+  checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
+  checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nfft*nsub));
+
+  // Allocate device memory for chirp
+  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin*nsub));
+
+  // Allocate memory for redigitized output and header
+  header=(char *) malloc(sizeof(char)*HEADERSIZE);
+  hbuf=(char *) malloc(sizeof(char)*4*nsamp*nsub);
+  checkCudaErrors(cudaMalloc((void **) &dbuf,sizeof(char)*4*nsamp*nsub));
+
+  // Allocate output buffers
+  fbuf=(float *) malloc(sizeof(float)*nsamp*nsub);
+  checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
+
+  // Generate FFT plan (batch in-place forward FFT)
+  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
+
+  // Generate FFT plan (batch in-place backward FFT)
+  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
+
+  // Copy chirp to device
+  checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin*nsub,cudaMemcpyHostToDevice));
+
+  // Read fil file header and dump in output file
+  file=fopen("header.fil","r");
+  fread(header,sizeof(char),351,file);
+  fclose(file);
+  ofile=fopen("test.fil","w");
+  fwrite(header,sizeof(char),351,ofile);
+
+  // Read file and buffer
+  file=fopen("test.dada","r");
+  fread(header,sizeof(char),HEADERSIZE,file);
+
+  // Loop over input file contents
+  for (iblock=0;;iblock++) {
+    nread=fread(hbuf,sizeof(char),4*nsamp*nsub,file)/(4*nsub);
+    if (nread==0)
+      break;
+
+    printf("%d %d\n",iblock,nread);
+
+    // Copy buffer to device
+    checkCudaErrors(cudaMemcpy(dbuf,hbuf,sizeof(char)*4*nread*nsub,cudaMemcpyHostToDevice));
+
+    // Unpack data and padd data
+    blocksize.x=32; blocksize.y=32; blocksize.z=1;
+    gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
+    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nbin,nfft,nsub,noverlap,cp1,cp2);
+
+    // Perform FFTs
+    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
+    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_FORWARD));
+
+    // Swap spectrum halves for large FFTs
+    blocksize.x=32; blocksize.y=32; blocksize.z=1;
+    gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft*nsub/blocksize.y+1; gridsize.z=1;
+    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,nbin,nfft*nsub);
+
+    // Perform complex multiplication of FFT'ed data with chirp (in place)
+    blocksize.x=32; blocksize.y=32; blocksize.z=1;
+    gridsize.x=nbin*nsub/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=1;
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nbin*nsub,nfft,1.0/(float) nbin);
+    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nbin*nsub,nfft,1.0/(float) nbin);
+
+    // Swap spectrum halves for small FFTs
+    blocksize.x=32; blocksize.y=32; blocksize.z=1;
+    gridsize.x=mbin/blocksize.x+1; gridsize.y=nchan*nfft*nsub/blocksize.y+1; gridsize.z=1;
+    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan*nfft*nsub);
+
+    // Perform FFTs
+    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
+    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
+
+    // Detect data
+    blocksize.x=32; blocksize.y=32; blocksize.z=1;
+    gridsize.x=mbin/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=nfft/blocksize.z+1;
+    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan,nfft,nsub,noverlap/nchan,nread/nchan,dfbuf);
+    
+    // Copy buffer to host
+    checkCudaErrors(cudaMemcpy(fbuf,dfbuf,sizeof(float)*nread*nsub,cudaMemcpyDeviceToHost));
+
+    printf("%d\n",nread*nsub*sizeof(float));
+    // Write buffer
+    fwrite(fbuf,sizeof(float),nread*nsub,ofile);
+  }
+
+  // Close files
+  fclose(ofile);
+  fclose(file);
+
+  // Free
+  free(header);
+  free(hbuf);
+  free(fbuf);
+  free(c);
+  cudaFree(dbuf);
+  cudaFree(dfbuf);
+  cudaFree(cp1);
+  cudaFree(cp2);
+  cudaFree(dc);
+  for (i=0;i<4;i++)
+    free(h5.rawfname[i]);
+
+  // Free plan
+  cufftDestroy(ftc2cf);
+  cufftDestroy(ftc2cb);
+
+  return 0;
+}
+
+// This is a simple H5 reader for complex voltage data. Very little
+// error checking is done.
+struct header read_h5_header(char *fname)
+{
+  int i,len;
+  struct header h;
+  hid_t file_id,attr_id,sap_id,beam_id,memtype,group_id,space,coord_id;
+  char *string,*pch;
+  const char *stokes[]={"_S0_","_S1_","_S2_","_S3_"};
+  char *froot,*fpart,*ftest;
+  FILE *file;
+
+  // Find filenames
+  for (i=0;i<4;i++) {
+    pch=strstr(fname,stokes[i]);
+    if (pch!=NULL)
+      break;
+  }
+  len=strlen(fname)-strlen(pch);
+  froot=(char *) malloc(sizeof(char)*len);
+  fpart=(char *) malloc(sizeof(char)*(strlen(pch)-7));
+  ftest=(char *) malloc(sizeof(char)*(len+10));
+  strncpy(froot,fname,len);
+  strncpy(fpart,pch+4,strlen(pch)-7);
+
+  // Check files
+  for (i=0;i<4;i++) {
+    // Format file name
+    sprintf(ftest,"%s_S%d_%s.raw",froot,i,fpart);
+
+    // Try to open
+    if ((file=fopen(ftest,"r"))!=NULL) {
+      fclose(file);
+    } else {
+      fprintf(stderr,"Raw file %s not found\n",ftest);
+      exit (-1);
+    }
+    h.rawfname[i]=(char *) malloc(sizeof(char)*strlen(ftest));
+    strcpy(h.rawfname[i],ftest);
+  }
+
+  // Free
+  free(froot);
+  free(fpart);
+  free(ftest);
+
+  // Open file
+  file_id=H5Fopen(fname,H5F_ACC_RDONLY,H5P_DEFAULT);
+
+  // Open subarray pointing group
+  sap_id=H5Gopen(file_id,"SUB_ARRAY_POINTING_000",H5P_DEFAULT);
+
+  // Start MJD
+  attr_id=H5Aopen(sap_id,"EXPTIME_START_MJD",H5P_DEFAULT);
+  H5Aread(attr_id,H5T_IEEE_F64LE,&h.tstart);
+  H5Aclose(attr_id);
+
+  // Declination
+  attr_id=H5Aopen(sap_id,"POINT_DEC",H5P_DEFAULT);
+  H5Aread(attr_id,H5T_IEEE_F64LE,&h.src_dej);
+  H5Aclose(attr_id);
+
+  // Right ascension
+  attr_id=H5Aopen(sap_id,"POINT_RA",H5P_DEFAULT);
+  H5Aread(attr_id,H5T_IEEE_F64LE,&h.src_raj);
+  H5Aclose(attr_id);
+
+  // Open beam 0
+  beam_id=H5Gopen(sap_id,"BEAM_000",H5P_DEFAULT);
+
+  // Number of samples
+  attr_id=H5Aopen(beam_id,"NOF_SAMPLES",H5P_DEFAULT);
+  H5Aread(attr_id,H5T_STD_U32LE,&h.nsamp);
+  H5Aclose(attr_id);
+
+  // Center frequency
+  attr_id=H5Aopen(beam_id,"BEAM_FREQUENCY_CENTER",H5P_DEFAULT);
+  H5Aread(attr_id,H5T_IEEE_F64LE,&h.fcen);
+  H5Aclose(attr_id);
+
+  // Center frequency unit
+  attr_id=H5Aopen(beam_id,"BEAM_FREQUENCY_CENTER_UNIT",H5P_DEFAULT);
+  memtype=H5Tcopy(H5T_C_S1);
+  H5Tset_size(memtype,H5T_VARIABLE);
+  H5Aread(attr_id,memtype,&string);
+  H5Aclose(attr_id);
+  if (strcmp(string,"Hz")==0)
+    h.fcen/=1e6;
+
+  // Channel bandwidth
+  attr_id=H5Aopen(beam_id,"CHANNEL_WIDTH",H5P_DEFAULT);
+  H5Aread(attr_id,H5T_IEEE_F64LE,&h.bwchan);
+  H5Aclose(attr_id);
+
+  // Center frequency unit
+  attr_id=H5Aopen(beam_id,"CHANNEL_WIDTH_UNIT",H5P_DEFAULT);
+  memtype=H5Tcopy(H5T_C_S1);
+  H5Tset_size(memtype,H5T_VARIABLE);
+  H5Aread(attr_id,memtype,&string);
+  H5Aclose(attr_id);
+  if (strcmp(string,"Hz")==0)
+    h.bwchan/=1e6;
+
+  // Get source
+  attr_id=H5Aopen(beam_id,"TARGETS",H5P_DEFAULT);
+  memtype=H5Tcopy(H5T_C_S1);
+  H5Tset_size(memtype,H5T_VARIABLE);
+  H5Aread(attr_id,memtype,&string);
+  H5Aclose(attr_id);
+  strcpy(h.source_name,string);
+
+  // Open coordinates
+  coord_id=H5Gopen(beam_id,"COORDINATES",H5P_DEFAULT);
+
+  // Open coordinate 0
+  group_id=H5Gopen(coord_id,"COORDINATE_0",H5P_DEFAULT);
+
+  // Sampling time
+  attr_id=H5Aopen(group_id,"INCREMENT",H5P_DEFAULT);
+  H5Aread(attr_id,H5T_IEEE_F64LE,&h.tsamp);
+  H5Aclose(attr_id);
+
+  // Close group
+  H5Gclose(group_id);
+
+  // Open coordinate 1
+  group_id=H5Gopen(coord_id,"COORDINATE_1",H5P_DEFAULT);
+
+  // Number of subbands
+  attr_id=H5Aopen(group_id,"AXIS_VALUES_WORLD",H5P_DEFAULT);
+  space=H5Aget_space(attr_id);
+  h.nsub=H5Sget_simple_extent_npoints(space);
+  H5Aclose(attr_id);
+
+  // Close group
+  H5Gclose(group_id);
+
+  // Close coordinates
+  H5Gclose(coord_id);
+
+  // Close beam, sap and file
+  H5Gclose(beam_id);
+  H5Gclose(sap_id);
+  H5Fclose(file_id);
+
+  return h;
+}
+
+// Compute chirp
 void get_channel_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c)
 {
   int ibin,ichan,isub,mbin,idx;
@@ -191,160 +508,4 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
   }
 
   return;
-}
-
-int main(int argc,char *argv[])
-{
-  int nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20;
-  int iblock,nread;
-  char *header,*hbuf,*dbuf;
-  FILE *file,*ofile;
-  float *fbuf,*dfbuf;
-  cufftComplex *cp1,*cp2,*dc,*c;
-  cufftHandle ftc2cf,ftc2cb;
-  int idist,odist,iembed,oembed,istride,ostride;
-  dim3 blocksize,gridsize;
-
-  c=(cufftComplex *) malloc(sizeof(cufftComplex)*nbin*nsub);
-
-  // Compute chirp
-  get_channel_chirp(119.62890625,nsub*0.1953125,39.659298,nchan,nbin,nsub,c);
-
-  // Data size
-  nvalid=nbin-2*noverlap;
-  nsamp=200*nvalid;
-  nfft=(int) ceil(nsamp/(float) nvalid);
-  mbin=nbin/nchan;
-
-  printf("nbin: %d nfft: %d nsub: %d mbin: %d nchan: %d nsamp: %d nvalid: %d\n",nbin,nfft,nsub,mbin,nchan,nsamp,nvalid);
-
-  // Allocate memory for complex timeseries
-  checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
-  checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nfft*nsub));
-
-  // Allocate device memory for chirp
-  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin*nsub));
-
-  // Allocate memory for redigitized output and header
-  header=(char *) malloc(sizeof(char)*HEADERSIZE);
-  hbuf=(char *) malloc(sizeof(char)*4*nsamp*nsub);
-  checkCudaErrors(cudaMalloc((void **) &dbuf,sizeof(char)*4*nsamp*nsub));
-
-  // Allocate output buffers
-  fbuf=(float *) malloc(sizeof(float)*nsamp*nsub);
-  checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
-
-  // Generate FFT plan (batch in-place forward FFT)
-  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
-
-  // Generate FFT plan (batch in-place backward FFT)
-  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
-
-  // Copy chirp to device
-  checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin*nsub,cudaMemcpyHostToDevice));
-
-  // Read fil file header and dump in output file
-  file=fopen("header.fil","r");
-  fread(header,sizeof(char),351,file);
-  fclose(file);
-  ofile=fopen("test.fil","w");
-  fwrite(header,sizeof(char),351,ofile);
-
-  // Read file and buffer
-  file=fopen("test.dada","r");
-  fread(header,sizeof(char),HEADERSIZE,file);
-
-  // Loop over input file contents
-  for (iblock=0;;iblock++) {
-    nread=fread(hbuf,sizeof(char),4*nsamp*nsub,file)/(4*nsub);
-    if (nread==0)
-      break;
-
-    // Copy buffer to device
-    checkCudaErrors(cudaMemcpy(dbuf,hbuf,sizeof(char)*4*nread*nsub,cudaMemcpyHostToDevice));
-
-    // Unpack data and padd data
-    blocksize.x=32;
-    blocksize.y=32;
-    blocksize.z=1;
-    gridsize.x=nbin/blocksize.x+1;
-    gridsize.y=nfft/blocksize.y+1;
-    gridsize.z=nsub/blocksize.z+1;
-    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nbin,nfft,nsub,noverlap,cp1,cp2);
-
-    // Perform FFTs
-    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
-    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_FORWARD));
-
-    // Swap spectrum halves for large FFTs
-    blocksize.x=32;
-    blocksize.y=32;
-    blocksize.z=1;
-    gridsize.x=nbin/blocksize.x+1;
-    gridsize.y=nfft*nsub/blocksize.y+1;
-    gridsize.z=1;
-    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,nbin,nfft*nsub);
-
-    // Perform complex multiplication of FFT'ed data with chirp (in place)
-    blocksize.x=32;
-    blocksize.y=32;
-    blocksize.z=1;
-    gridsize.x=nbin*nsub/blocksize.x+1;
-    gridsize.y=nfft/blocksize.y+1;
-    gridsize.z=1;
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nbin*nsub,nfft,1.0/(float) nbin);
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nbin*nsub,nfft,1.0/(float) nbin);
-
-    // Swap spectrum halves for small FFTs
-    blocksize.x=32;
-    blocksize.y=32;
-    blocksize.z=1;
-    gridsize.x=mbin/blocksize.x+1;
-    gridsize.y=nchan*nfft*nsub/blocksize.y+1;
-    gridsize.z=1;
-    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan*nfft*nsub);
-
-    // Perform FFTs
-    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
-    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
-
-    // Detect data
-    blocksize.x=32;
-    blocksize.y=32;
-    blocksize.z=1;
-    gridsize.x=mbin/blocksize.x+1;
-    gridsize.y=nchan/blocksize.y+1;
-    gridsize.z=nfft/blocksize.z+1;
-    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan,nfft,nsub,noverlap/nchan,nread/nchan,dfbuf);
-    
-    // Copy buffer to host
-    checkCudaErrors(cudaMemcpy(fbuf,dfbuf,sizeof(float)*nread*nsub,cudaMemcpyDeviceToHost));
-
-    // Write buffer
-    fwrite(fbuf,sizeof(float),nread*nsub,ofile);
-  }
-
-  // Close files
-  fclose(ofile);
-  fclose(file);
-
-  // Free
-  free(header);
-  free(hbuf);
-  free(fbuf);
-  free(c);
-  cudaFree(dbuf);
-  cudaFree(dfbuf);
-  cudaFree(cp1);
-  cudaFree(cp2);
-  cudaFree(dc);
-
-
-  // Free plan
-  cufftDestroy(ftc2cf);
-  cufftDestroy(ftc2cb);
-
-  return 0;
 }

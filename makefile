@@ -5,13 +5,20 @@ CUDAPATH = /opt/cuda
 CFLAGS = -I$(CUDAPATH)/samples/common/inc
 
 # Linking flags
-LFLAGS = -lm -L$(CUDAPATH)/lib64 -lcufft -lcurand
+LFLAGS = -lm -L$(CUDAPATH)/lib64 -lcufft -lhdf5
 
-# Compiler
+# Compilers
 NVCC = $(CUDAPATH)/bin/nvcc
+CC = gcc
 
-cdmt: cdmt.cu
-	$(NVCC) $(CFLAGS) -o cdmt cdmt.cu $(LFLAGS)
+cdmt: cdmt.o
+	$(NVCC) $(CFLAGS) -o cdmt cdmt.o $(LFLAGS)
+
+cdmt.o: cdmt.cu
+	$(NVCC) $(CFLAGS) -o $@ -c $<
+
+skz.o: skz.cu
+	$(NVCC) $(CFLAGS) -o $@ -c $<
 
 codedisp: codedisp.cu
 	$(NVCC) $(CFLAGS) -o codedisp codedisp.cu $(LFLAGS)
