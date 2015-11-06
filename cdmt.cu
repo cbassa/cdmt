@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 #include <cuda.h>
 #include <cufft.h>
 #include <helper_functions.h>
@@ -29,7 +30,7 @@ static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftCo
 static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale);
 __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
-void write_filterbank_header(struct header h,char *fname);
+void write_filterbank_header(struct header h,FILE *file);
 
 int main(int argc,char *argv[])
 {
@@ -43,10 +44,10 @@ int main(int argc,char *argv[])
   int idist,odist,iembed,oembed,istride,ostride;
   dim3 blocksize,gridsize;
   struct header h5;
-  char filename[]="/data1/bassa/complex_voltage/J1810+1744_8bit/L243355_SAP000_B000_S1_P002_bf.h5";
+  clock_t startclock;
 
   // Read HDF5 header
-  h5=read_h5_header(filename);
+  h5=read_h5_header(argv[1]);
 
   // Set number of subbands
   nsub=h5.nsub;
@@ -57,9 +58,6 @@ int main(int argc,char *argv[])
   h5.nbit=32;
   h5.fch1=h5.fcen+0.5*h5.nsub*h5.bwchan-0.5*h5.bwchan/nchan;
   h5.foff=-fabs(h5.bwchan/nchan);
-
-  // Write filterbank header
-  write_filterbank_header(h5,"cdmt.fil");
 
   // Allocate chirp
   c=(cufftComplex *) malloc(sizeof(cufftComplex)*nbin*nsub);
@@ -105,7 +103,10 @@ int main(int argc,char *argv[])
   checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin*nsub,cudaMemcpyHostToDevice));
 
   // Open output file
-  ofile=fopen("cdmt.fil","a");
+  ofile=fopen("fifo","w");
+
+  // Write filterbank header
+  write_filterbank_header(h5,ofile);
 
   // Read files
   for (i=0;i<4;i++) 
@@ -114,12 +115,15 @@ int main(int argc,char *argv[])
   // Loop over input file contents
   for (iblock=0;;iblock++) {
     // Read block
+    startclock=clock();
     for (i=0;i<4;i++)
       nread=fread(h5buf[i],sizeof(char),nsamp*nsub,file[i])/nsub;
     if (nread==0)
       break;
+    printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     // Copy buffers to device
+    startclock=clock();
     for (i=0;i<4;i++)
       checkCudaErrors(cudaMemcpy(dh5buf[i],h5buf[i],sizeof(char)*nread*nsub,cudaMemcpyHostToDevice));
 
@@ -159,10 +163,12 @@ int main(int argc,char *argv[])
     
     // Copy buffer to host
     checkCudaErrors(cudaMemcpy(fbuf,dfbuf,sizeof(float)*nread*nsub,cudaMemcpyDeviceToHost));
+    printf("Executed kernels in %.2f s\n",(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
-    printf("%d\n",nread*nsub*sizeof(float));
     // Write buffer
+    startclock=clock();
     fwrite(fbuf,sizeof(float),nread*nsub,ofile);
+    printf("Write %d MB in %.2f s\n",nread*nsub*sizeof(float)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
 
   // Close files
@@ -578,17 +584,14 @@ double dec2sex(double x)
   return d;
 }
 
-void write_filterbank_header(struct header h,char *fname)
+void write_filterbank_header(struct header h,FILE *file)
 {
-  FILE *file;
   double ra,de;
 
 
   ra=dec2sex(h.src_raj/15.0);
   de=dec2sex(h.src_dej);
   
-
-  file=fopen(fname,"w");
   send_string("HEADER_START",file);
   send_string("rawdatafile",file);
   send_string(h.rawfname[0],file);
@@ -609,7 +612,6 @@ void write_filterbank_header(struct header h,char *fname)
   send_double("tsamp",h.tsamp,file);
   send_int("nifs",1,file);
   send_string("HEADER_END",file);
-  fclose(file);
 
   return;
 }
