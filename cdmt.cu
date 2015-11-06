@@ -27,7 +27,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float s);
 static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftComplex b);
 static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale);
-__global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
+__global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
 void write_filterbank_header(struct header h,char *fname);
 
@@ -35,8 +35,8 @@ int main(int argc,char *argv[])
 {
   int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20;
   int iblock,nread;
-  char *header,*hbuf,*dbuf;
-  FILE *file,*ofile;
+  char *header,*h5buf[4],*dh5buf[4];
+  FILE *file[4],*ofile;
   float *fbuf,*dfbuf;
   cufftComplex *cp1,*cp2,*dc,*c;
   cufftHandle ftc2cf,ftc2cb;
@@ -84,8 +84,10 @@ int main(int argc,char *argv[])
 
   // Allocate memory for redigitized output and header
   header=(char *) malloc(sizeof(char)*HEADERSIZE);
-  hbuf=(char *) malloc(sizeof(char)*4*nsamp*nsub);
-  checkCudaErrors(cudaMalloc((void **) &dbuf,sizeof(char)*4*nsamp*nsub));
+  for (i=0;i<4;i++) {
+    h5buf[i]=(char *) malloc(sizeof(char)*nsamp*nsub);
+    checkCudaErrors(cudaMalloc((void **) &dh5buf[i],sizeof(char)*nsamp*nsub));
+  }
 
   // Allocate output buffers
   fbuf=(float *) malloc(sizeof(float)*nsamp*nsub);
@@ -105,25 +107,26 @@ int main(int argc,char *argv[])
   // Open output file
   ofile=fopen("cdmt.fil","a");
 
-  // Read file and buffer
-  file=fopen("test.dada","r");
-  fread(header,sizeof(char),HEADERSIZE,file);
+  // Read files
+  for (i=0;i<4;i++) 
+    file[i]=fopen(h5.rawfname[i],"r");
 
   // Loop over input file contents
   for (iblock=0;;iblock++) {
-    nread=fread(hbuf,sizeof(char),4*nsamp*nsub,file)/(4*nsub);
+    // Read block
+    for (i=0;i<4;i++)
+      nread=fread(h5buf[i],sizeof(char),nsamp*nsub,file[i])/nsub;
     if (nread==0)
       break;
 
-    printf("%d %d\n",iblock,nread);
-
-    // Copy buffer to device
-    checkCudaErrors(cudaMemcpy(dbuf,hbuf,sizeof(char)*4*nread*nsub,cudaMemcpyHostToDevice));
+    // Copy buffers to device
+    for (i=0;i<4;i++)
+      checkCudaErrors(cudaMemcpy(dh5buf[i],h5buf[i],sizeof(char)*nread*nsub,cudaMemcpyHostToDevice));
 
     // Unpack data and padd data
     blocksize.x=32; blocksize.y=32; blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
-    unpack_and_padd<<<gridsize,blocksize>>>(dbuf,nread,nbin,nfft,nsub,noverlap,cp1,cp2);
+    unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1,cp2);
 
     // Perform FFTs
     checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
@@ -164,20 +167,22 @@ int main(int argc,char *argv[])
 
   // Close files
   fclose(ofile);
-  fclose(file);
+  for (i=0;i<4;i++)
+    fclose(file[i]);
 
   // Free
   free(header);
-  free(hbuf);
+  for (i=0;i<4;i++) {
+    free(h5buf[i]);
+    cudaFree(dh5buf);
+    free(h5.rawfname[i]);
+  }
   free(fbuf);
   free(c);
-  cudaFree(dbuf);
   cudaFree(dfbuf);
   cudaFree(cp1);
   cudaFree(cp2);
   cudaFree(dc);
-  for (i=0;i<4;i++)
-    free(h5.rawfname[i]);
 
   // Free plan
   cufftDestroy(ftc2cf);
@@ -420,7 +425,7 @@ static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,
 // Unpack the input buffer and generate complex timeseries. The output
 // timeseries are padded with noverlap samples on either side for the
 // convolution.
-__global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+__global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
 {
   int64_t ibin,ifft,isamp,isub,idx1,idx2;
 
@@ -440,10 +445,10 @@ __global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int nsub,
       cp2[idx1].x=0.0;
       cp2[idx1].y=0.0;
     } else {
-      cp1[idx1].x=(float) dbuf[4*idx2];
-      cp1[idx1].y=(float) dbuf[4*idx2+1];
-      cp2[idx1].x=(float) dbuf[4*idx2+2];
-      cp2[idx1].y=(float) dbuf[4*idx2+3];
+      cp1[idx1].x=(float) dbuf0[idx2];
+      cp1[idx1].y=(float) dbuf1[idx2];
+      cp2[idx1].x=(float) dbuf2[idx2];
+      cp2[idx1].y=(float) dbuf3[idx2];
     }
   }
 
