@@ -29,6 +29,7 @@ static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftCo
 static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale);
 __global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
+void write_filterbank_header(struct header h,char *fname);
 
 int main(int argc,char *argv[])
 {
@@ -49,6 +50,16 @@ int main(int argc,char *argv[])
 
   // Set number of subbands
   nsub=h5.nsub;
+
+  // Adjust header for filterbank format
+  h5.tsamp*=nchan;
+  h5.nchan=nsub*nchan;
+  h5.nbit=32;
+  h5.fch1=h5.fcen+0.5*h5.nsub*h5.bwchan-0.5*h5.bwchan/nchan;
+  h5.foff=-fabs(h5.bwchan/nchan);
+
+  // Write filterbank header
+  write_filterbank_header(h5,"cdmt.fil");
 
   // Allocate chirp
   c=(cufftComplex *) malloc(sizeof(cufftComplex)*nbin*nsub);
@@ -91,12 +102,8 @@ int main(int argc,char *argv[])
   // Copy chirp to device
   checkCudaErrors(cudaMemcpy(dc,c,sizeof(cufftComplex)*nbin*nsub,cudaMemcpyHostToDevice));
 
-  // Read fil file header and dump in output file
-  file=fopen("header.fil","r");
-  fread(header,sizeof(char),351,file);
-  fclose(file);
-  ofile=fopen("test.fil","w");
-  fwrite(header,sizeof(char),351,ofile);
+  // Open output file
+  ofile=fopen("cdmt.fil","a");
 
   // Read file and buffer
   file=fopen("test.dada","r");
@@ -506,6 +513,98 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 	fbuf[idx2]=cp1[idx1].x*cp1[idx1].x+cp1[idx1].y*cp1[idx1].y+cp2[idx1].x*cp2[idx1].x+cp2[idx1].y*cp2[idx1].y;
     }
   }
+
+  return;
+}
+
+void send_string(char *string,FILE *file)
+{
+  int len;
+
+  len=strlen(string);
+  fwrite(&len,sizeof(int),1,file);
+  fwrite(string,sizeof(char),len,file);
+
+  return;
+}
+
+void send_float(char *string,float x,FILE *file)
+{
+  send_string(string,file);
+  fwrite(&x,sizeof(float),1,file);
+
+  return;
+}
+
+void send_int(char *string,int x,FILE *file)
+{
+  send_string(string,file);
+  fwrite(&x,sizeof(int),1,file);
+
+  return;
+}
+
+void send_double(char *string,double x,FILE *file)
+{
+  send_string(string,file);
+  fwrite(&x,sizeof(double),1,file);
+
+  return;
+}
+
+double dec2sex(double x)
+{
+  double d,sec,min,deg;
+  char sign;
+  char tmp[32];
+
+  sign=(x<0 ? '-' : ' ');
+  x=3600.0*fabs(x);
+
+  sec=fmod(x,60.0);
+  x=(x-sec)/60.0;
+  min=fmod(x,60.0);
+  x=(x-min)/60.0;
+  deg=x;
+
+  sprintf(tmp,"%c%02d%02d%09.6lf",sign,(int) deg,(int) min,sec);
+  sscanf(tmp,"%lf",&d);
+
+  return d;
+}
+
+void write_filterbank_header(struct header h,char *fname)
+{
+  FILE *file;
+  double ra,de;
+
+
+  ra=dec2sex(h.src_raj/15.0);
+  de=dec2sex(h.src_dej);
+  
+
+  file=fopen(fname,"w");
+  send_string("HEADER_START",file);
+  send_string("rawdatafile",file);
+  send_string(h.rawfname[0],file);
+  send_string("source_name",file);
+  send_string(h.source_name,file);
+  send_int("machine_id",11,file);
+  send_int("telescope_id",11,file);
+  send_double("src_raj",ra,file);
+  send_double("src_dej",de,file);
+  send_int("data_type",1,file);
+  send_double("fch1",h.fch1,file);
+  send_double("foff",h.foff,file);
+  send_int("nchans",160,file);
+  send_int("nbeams",0,file);
+  send_int("ibeam",0,file);
+  send_int("nbits",h.nbit,file);
+  send_double("tstart",h.tstart,file);
+  send_double("tsamp",h.tsamp,file);
+  send_int("nifs",1,file);
+  send_string("HEADER_END",file);
+  fclose(file);
 
   return;
 }
