@@ -27,97 +27,32 @@ void get_channel_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsu
 __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,int nbin,int nchan,int nfft,int nsub,int noverlap,int nsamp,float *fbuf);
 static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float s);
 static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftComplex b);
-static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale);
+static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,int l,float scale);
 __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
-__global__ void compute_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c);
+__global__ void compute_chirp(double fcen,double bw,float *dm,int nchan,int nbin,int nsub,int ndm,cufftComplex *c);
+__global__ void compute_block_sums(float *z,int nchan,int nblock,int nsum,float *bs1,float *bs2);
+__global__ void compute_channel_statistics(int nchan,int nblock,int nsum,float *bs1,float *bs2,float *zavg,float *zstd);
+__global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
 void write_filterbank_header(struct header h,FILE *file);
-
-// Compute segmented sums for later computation of offset and scale
-__global__ void compute_block_sums(float *z,int nchan,int nblock,int nsum,float *bs1,float *bs2)
-{
-  int64_t ichan,iblock,isum,idx1,idx2;
-
-  ichan=blockIdx.x*blockDim.x+threadIdx.x;
-  iblock=blockIdx.y*blockDim.y+threadIdx.y;
-  if (ichan<nchan && iblock<nblock) {
-    idx1=ichan+nchan*iblock;
-    bs1[idx1]=0.0;
-    bs2[idx1]=0.0;
-    for (isum=0;isum<nsum;isum++) {
-      idx2=ichan+nchan*(isum+iblock*nsum);
-      bs1[idx1]+=z[idx2];
-      bs2[idx1]+=z[idx2]*z[idx2];
-    }
-  }
-
-  return;
-}
-
-// Compute segmented sums for later computation of offset and scale
-__global__ void compute_channel_statistics(int nchan,int nblock,int nsum,float *bs1,float *bs2,float *zavg,float *zstd)
-{
-  int64_t ichan,iblock,idx1;
-  double s1,s2;
-
-  ichan=blockIdx.x*blockDim.x+threadIdx.x;
-  if (ichan<nchan) {
-    s1=0.0;
-    s2=0.0;
-    for (iblock=0;iblock<nblock;iblock++) {
-      idx1=ichan+nchan*iblock;
-      s1+=bs1[idx1];
-      s2+=bs2[idx1];
-    }
-    zavg[ichan]=s1/(float) (nblock*nsum);
-    zstd[ichan]=s2/(float) (nblock*nsum)-zavg[ichan]*zavg[ichan];
-    zstd[ichan]=sqrt(zstd[ichan]);
-  }
-
-  return;
-}
-
-// Redigitize the filterbank to 8 bits in segments
-__global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz)
-{
-  int64_t ichan,iblock,isum,idx1;
-  float zoffset,zscale;
-
-  ichan=blockIdx.x*blockDim.x+threadIdx.x;
-  iblock=blockIdx.y*blockDim.y+threadIdx.y;
-  if (ichan<nchan && iblock<nblock) {
-    zoffset=zavg[ichan]-zmin*zstd[ichan];
-    zscale=(zmin+zmax)*zstd[ichan];
-
-    for (isum=0;isum<nsum;isum++) {
-      idx1=ichan+nchan*(isum+iblock*nsum);
-      z[idx1]-=zoffset;
-      z[idx1]*=256.0/zscale;
-      cz[idx1]=(unsigned char) z[idx1];
-      if (z[idx1]<0.0) cz[idx1]=0;
-      if (z[idx1]>255.0) cz[idx1]=255;
-    }
-  }
-
-  return;
-}
-
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20;
-  int iblock,nread,mchan,msamp,mblock,msum=1024;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm=80;
+  int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
   char *header,*h5buf[4],*dh5buf[4];
-  FILE *file[4],*ofile;
+  FILE *file[4],**ofile;
   unsigned char *cbuf,*dcbuf;
   float *fbuf,*dfbuf;
   float *bs1,*bs2,*zavg,*zstd;
-  cufftComplex *cp1,*cp2,*dc;
+  cufftComplex *cp1,*cp2,*dc,*cp1p,*cp2p;
   cufftHandle ftc2cf,ftc2cb;
   int idist,odist,iembed,oembed,istride,ostride;
   dim3 blocksize,gridsize;
   struct header h5;
   clock_t startclock;
+  float *dm,*ddm;
+  char fname[128];
 
   // Read HDF5 header
   h5=read_h5_header(argv[1]);
@@ -134,7 +69,7 @@ int main(int argc,char *argv[])
 
   // Data size
   nvalid=nbin-2*noverlap;
-  nsamp=200*nvalid;
+  nsamp=100*nvalid;
   nfft=(int) ceil(nsamp/(float) nvalid);
   mbin=nbin/nchan;
   mchan=nsub*nchan;
@@ -146,9 +81,11 @@ int main(int argc,char *argv[])
   // Allocate memory for complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
   checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nfft*nsub));
+  checkCudaErrors(cudaMalloc((void **) &cp1p,sizeof(cufftComplex)*nbin*nfft*nsub));
+  checkCudaErrors(cudaMalloc((void **) &cp2p,sizeof(cufftComplex)*nbin*nfft*nsub));
 
   // Allocate device memory for chirp
-  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin*nsub));
+  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin*nsub*ndm));
 
   // Allocate device memory for block sums
   checkCudaErrors(cudaMalloc((void **) &bs1,sizeof(float)*mblock*mchan));
@@ -171,6 +108,13 @@ int main(int argc,char *argv[])
   cbuf=(unsigned char *) malloc(sizeof(unsigned char)*msamp*mchan);
   checkCudaErrors(cudaMalloc((void **) &dcbuf,sizeof(unsigned char)*msamp*mchan));
 
+  // Allocate DMs and copy to device
+  dm=(float *) malloc(sizeof(float)*ndm);
+  for (idm=0;idm<ndm;idm++)
+    dm[idm]=0.5+(float) idm;
+  checkCudaErrors(cudaMalloc((void **) &ddm,sizeof(float)*ndm));
+  checkCudaErrors(cudaMemcpy(ddm,dm,sizeof(float)*ndm,cudaMemcpyHostToDevice));
+
   // Generate FFT plan (batch in-place forward FFT)
   idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
   checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
@@ -181,16 +125,21 @@ int main(int argc,char *argv[])
 
   // Compute chirp
   blocksize.x=32; blocksize.y=32; blocksize.z=1;
-  gridsize.x=nsub/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=1;
-  compute_chirp<<<gridsize,blocksize>>>(h5.fcen,nsub*h5.bwchan,39.659298,nchan,nbin,nsub,dc);
+  gridsize.x=nsub/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=ndm/blocksize.z+1;
+  compute_chirp<<<gridsize,blocksize>>>(h5.fcen,nsub*h5.bwchan,ddm,nchan,nbin,nsub,ndm,dc);
 
-  // Open output file
-  ofile=fopen("cdmt.fil","w");
-
+  // Fix start time
   h5.tstart+=1800.0/86400.0;
 
-  // Write filterbank header
-  write_filterbank_header(h5,ofile);
+  // Allocate files
+  ofile=(FILE **) malloc(sizeof(FILE *)*ndm);
+
+  // Format file names, open files and write headers
+  for (idm=0;idm<ndm;idm++) {
+    sprintf(fname,"cdmt_cDM%.2f.fil",dm[idm]);
+    ofile[idm]=fopen(fname,"w");
+    write_filterbank_header(h5,ofile[idm]);
+  }
 
   // Read files
   for (i=0;i<4;i++) {
@@ -199,7 +148,7 @@ int main(int argc,char *argv[])
   }
 
   // Loop over input file contents
-  for (iblock=0;iblock<20;iblock++) {
+  for (iblock=0;iblock<40;iblock++) {
     // Read block
     startclock=clock();
     for (i=0;i<4;i++)
@@ -216,65 +165,66 @@ int main(int argc,char *argv[])
     // Unpack data and padd data
     blocksize.x=32; blocksize.y=32; blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
-    unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1,cp2);
+    unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
 
     // Perform FFTs
-    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_FORWARD));
-    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_FORWARD));
+    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1p,(cufftComplex *) cp1p,CUFFT_FORWARD));
+    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2p,(cufftComplex *) cp2p,CUFFT_FORWARD));
 
     // Swap spectrum halves for large FFTs
     blocksize.x=32; blocksize.y=32; blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft*nsub/blocksize.y+1; gridsize.z=1;
-    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,nbin,nfft*nsub);
+    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1p,cp2p,nbin,nfft*nsub);
 
-    // Perform complex multiplication of FFT'ed data with chirp (in place)
-    blocksize.x=32; blocksize.y=32; blocksize.z=1;
-    gridsize.x=nbin*nsub/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=1;
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1,dc,cp1,nbin*nsub,nfft,1.0/(float) nbin);
-    PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2,dc,cp2,nbin*nsub,nfft,1.0/(float) nbin);
+    // Loop over dms
+    for (idm=0;idm<ndm;idm++) {
 
-    // Swap spectrum halves for small FFTs
-    blocksize.x=32; blocksize.y=32; blocksize.z=1;
-    gridsize.x=mbin/blocksize.x+1; gridsize.y=nchan*nfft*nsub/blocksize.y+1; gridsize.z=1;
-    swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan*nfft*nsub);
+      // Perform complex multiplication of FFT'ed data with chirp
+      blocksize.x=32; blocksize.y=32; blocksize.z=1;
+      gridsize.x=nbin*nsub/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=1;
+      PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1p,dc,cp1,nbin*nsub,nfft,idm,1.0/(float) nbin);
+      PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2p,dc,cp2,nbin*nsub,nfft,idm,1.0/(float) nbin);
+      
+      // Swap spectrum halves for small FFTs
+      blocksize.x=32; blocksize.y=32; blocksize.z=1;
+      gridsize.x=mbin/blocksize.x+1; gridsize.y=nchan*nfft*nsub/blocksize.y+1; gridsize.z=1;
+      swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan*nfft*nsub);
+      
+      // Perform FFTs
+      checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
+      checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
+      
+      // Detect data
+      blocksize.x=32; blocksize.y=32; blocksize.z=1;
+      gridsize.x=mbin/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=nfft/blocksize.z+1;
+      transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan,nfft,nsub,noverlap/nchan,nread/nchan,dfbuf);
+      
+      // Compute block sums for redigitization
+      blocksize.x=32; blocksize.y=32; blocksize.z=1;
+      gridsize.x=mchan/blocksize.x+1; gridsize.y=mblock/blocksize.y+1; gridsize.z=1;
+      compute_block_sums<<<gridsize,blocksize>>>(dfbuf,mchan,mblock,msum,bs1,bs2);
+      
+      // Compute channel stats
+      blocksize.x=32; blocksize.y=1; blocksize.z=1;
+      gridsize.x=mchan/blocksize.x+1; gridsize.y=1; gridsize.z=1;
+      compute_channel_statistics<<<gridsize,blocksize>>>(mchan,mblock,msum,bs1,bs2,zavg,zstd);
 
-    // Perform FFTs
-    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
-    checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
-
-    // Detect data
-    blocksize.x=32; blocksize.y=32; blocksize.z=1;
-    gridsize.x=mbin/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=nfft/blocksize.z+1;
-    transpose_unpadd_and_detect<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan,nfft,nsub,noverlap/nchan,nread/nchan,dfbuf);
-
-    // Compute block sums for redigitization
-    blocksize.x=32; blocksize.y=32; blocksize.z=1;
-    gridsize.x=mchan/blocksize.x+1; gridsize.y=mblock/blocksize.y+1; gridsize.z=1;
-    compute_block_sums<<<gridsize,blocksize>>>(dfbuf,mchan,mblock,msum,bs1,bs2);
-
-    // Compute channel stats
-    blocksize.x=32; blocksize.y=1; blocksize.z=1;
-    gridsize.x=mchan/blocksize.x+1; gridsize.y=1; gridsize.z=1;
-    compute_channel_statistics<<<gridsize,blocksize>>>(mchan,mblock,msum,bs1,bs2,zavg,zstd);
-
-    // Redigitize data to 8bits
-    blocksize.x=32; blocksize.y=32; blocksize.z=1;
-    gridsize.x=mchan/blocksize.x+1; gridsize.y=mblock/blocksize.y+1; gridsize.z=1;
-    redigitize<<<gridsize,blocksize>>>(dfbuf,mchan,mblock,msum,zavg,zstd,3.0,5.0,dcbuf);
-
-    // Copy buffer to host
-    checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan,cudaMemcpyDeviceToHost));
-    printf("Executed kernels in %.2f s\n",(float) (clock()-startclock)/CLOCKS_PER_SEC);
-
-    // Write buffer
-    startclock=clock();
-    fwrite(cbuf,sizeof(unsigned char),nread*nsub,ofile);
-    //fwrite(fbuf,sizeof(float),nread*nsub,ofile);
-    printf("Write %d MB in %.2f s\n",nread*nsub*sizeof(unsigned char)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
+      // Redigitize data to 8bits
+      blocksize.x=32; blocksize.y=32; blocksize.z=1;
+      gridsize.x=mchan/blocksize.x+1; gridsize.y=mblock/blocksize.y+1; gridsize.z=1;
+      redigitize<<<gridsize,blocksize>>>(dfbuf,mchan,mblock,msum,zavg,zstd,3.0,5.0,dcbuf);
+      
+      // Copy buffer to host
+      checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan,cudaMemcpyDeviceToHost));
+      // Write buffer
+      fwrite(cbuf,sizeof(unsigned char),nread*nsub,ofile[idm]);
+    }
+    printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
 
   // Close files
-  fclose(ofile);
+  for (idm=0;idm<ndm;idm++)
+    fclose(ofile[idm]);
   for (i=0;i<4;i++)
     fclose(file[i]);
 
@@ -286,14 +236,20 @@ int main(int argc,char *argv[])
     free(h5.rawfname[i]);
   }
   free(fbuf);
+  free(dm);
+  free(cbuf);
   cudaFree(dfbuf);
+  cudaFree(dcbuf);
   cudaFree(cp1);
   cudaFree(cp2);
+  cudaFree(cp1p);
+  cudaFree(cp2p);
   cudaFree(dc);
   cudaFree(bs1);
   cudaFree(bs2);
   cudaFree(zavg);
   cudaFree(zstd);
+  cudaFree(ddm);
 
   // Free plan
   cufftDestroy(ftc2cf);
@@ -469,7 +425,7 @@ static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftCo
 }
 
 // Pointwise complex multiplication (and scaling)
-static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,float scale)
+static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,int l,float scale)
 {
   int i,j,k;
   i=blockIdx.x*blockDim.x+threadIdx.x;
@@ -477,18 +433,15 @@ static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,
 
   if (i<nx && j<ny) {
     k=i+nx*j;
-    c[k]=ComplexScale(ComplexMul(a[k],b[i]),scale);
+    c[k]=ComplexScale(ComplexMul(a[k],b[i+nx*l]),scale);
   }
 }
 
 // Compute chirp
-__global__ void compute_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c)
+__global__ void compute_chirp(double fcen,double bw,float *dm,int nchan,int nbin,int nsub,int ndm,cufftComplex *c)
 {
-  int ibin,ichan,isub,mbin,idx;
+  int ibin,ichan,isub,idm,mbin,idx;
   double s,rt,t,f,fsub,fchan,bwchan,bwsub;
-
-  // Main constant
-  s=2.0*M_PI*dm/DMCONSTANT;
 
   // Number of channels per subband
   mbin=nbin/nchan;
@@ -502,9 +455,13 @@ __global__ void compute_chirp(double fcen,double bw,float dm,int nchan,int nbin,
   // Indices of input data
   isub=blockIdx.x*blockDim.x+threadIdx.x;
   ichan=blockIdx.y*blockDim.y+threadIdx.y;
+  idm=blockIdx.z*blockDim.z+threadIdx.z;
 
   // Keep in range
-  if (isub<nsub && ichan<nchan) {
+  if (isub<nsub && ichan<nchan && idm<ndm) {
+    // Main constant
+    s=2.0*M_PI*dm[idm]/DMCONSTANT;
+
     // Frequencies
     fsub=fcen-0.5*bw+bw*(float) isub/(float) nsub+0.5*bw/(float) nsub;
     fchan=fsub-0.5*bwsub+bwsub*(float) ichan/(float) nchan+0.5*bwsub/(float) nchan;
@@ -521,7 +478,7 @@ __global__ void compute_chirp(double fcen,double bw,float dm,int nchan,int nbin,
       t=1.0/sqrt(1.0+pow((f/(0.47*bwchan)),80));
       
       // Index
-      idx=ibin+ichan*mbin+isub*mbin*nchan;
+      idx=ibin+ichan*mbin+isub*mbin*nchan+idm*nsub*mbin*nchan;
       
       // Chirp
       c[idx].x=cos(rt)*t;
@@ -716,6 +673,75 @@ void write_filterbank_header(struct header h,FILE *file)
   send_double("tsamp",h.tsamp,file);
   send_int("nifs",1,file);
   send_string("HEADER_END",file);
+
+  return;
+}
+
+// Compute segmented sums for later computation of offset and scale
+__global__ void compute_block_sums(float *z,int nchan,int nblock,int nsum,float *bs1,float *bs2)
+{
+  int64_t ichan,iblock,isum,idx1,idx2;
+
+  ichan=blockIdx.x*blockDim.x+threadIdx.x;
+  iblock=blockIdx.y*blockDim.y+threadIdx.y;
+  if (ichan<nchan && iblock<nblock) {
+    idx1=ichan+nchan*iblock;
+    bs1[idx1]=0.0;
+    bs2[idx1]=0.0;
+    for (isum=0;isum<nsum;isum++) {
+      idx2=ichan+nchan*(isum+iblock*nsum);
+      bs1[idx1]+=z[idx2];
+      bs2[idx1]+=z[idx2]*z[idx2];
+    }
+  }
+
+  return;
+}
+
+// Compute segmented sums for later computation of offset and scale
+__global__ void compute_channel_statistics(int nchan,int nblock,int nsum,float *bs1,float *bs2,float *zavg,float *zstd)
+{
+  int64_t ichan,iblock,idx1;
+  double s1,s2;
+
+  ichan=blockIdx.x*blockDim.x+threadIdx.x;
+  if (ichan<nchan) {
+    s1=0.0;
+    s2=0.0;
+    for (iblock=0;iblock<nblock;iblock++) {
+      idx1=ichan+nchan*iblock;
+      s1+=bs1[idx1];
+      s2+=bs2[idx1];
+    }
+    zavg[ichan]=s1/(float) (nblock*nsum);
+    zstd[ichan]=s2/(float) (nblock*nsum)-zavg[ichan]*zavg[ichan];
+    zstd[ichan]=sqrt(zstd[ichan]);
+  }
+
+  return;
+}
+
+// Redigitize the filterbank to 8 bits in segments
+__global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz)
+{
+  int64_t ichan,iblock,isum,idx1;
+  float zoffset,zscale;
+
+  ichan=blockIdx.x*blockDim.x+threadIdx.x;
+  iblock=blockIdx.y*blockDim.y+threadIdx.y;
+  if (ichan<nchan && iblock<nblock) {
+    zoffset=zavg[ichan]-zmin*zstd[ichan];
+    zscale=(zmin+zmax)*zstd[ichan];
+
+    for (isum=0;isum<nsum;isum++) {
+      idx1=ichan+nchan*(isum+iblock*nsum);
+      z[idx1]-=zoffset;
+      z[idx1]*=256.0/zscale;
+      cz[idx1]=(unsigned char) z[idx1];
+      if (z[idx1]<0.0) cz[idx1]=0;
+      if (z[idx1]>255.0) cz[idx1]=255;
+    }
+  }
 
   return;
 }
