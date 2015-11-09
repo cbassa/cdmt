@@ -1,8 +1,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <math.h>
 #include <time.h>
+//#include <sys/types.h>
+//#include <sys/socket.h>
+#include <arpa/inet.h> 
+//#include <netinet/in.h>
+//#include <netdb.h>
 #include <cuda.h>
 #include <cufft.h>
 #include <helper_functions.h>
@@ -38,10 +44,10 @@ void write_filterbank_header(struct header h,FILE *file);
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm=80;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm=8;
   int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
   char *header,*h5buf[4],*dh5buf[4];
-  FILE *file[4],**ofile;
+  FILE *file[4];
   unsigned char *cbuf,*dcbuf;
   float *fbuf,*dfbuf;
   float *bs1,*bs2,*zavg,*zstd;
@@ -52,7 +58,17 @@ int main(int argc,char *argv[])
   struct header h5;
   clock_t startclock;
   float *dm,*ddm;
-  char fname[128];
+  char fname[128],fheader[1024];
+  int *skt,bytes_read;
+  struct sockaddr_in addr;
+  const char *ip_address[2]={"10.168.139.1","10.168.140.1"};
+  int port=56000,part=2;
+  int *iskt,nskt;
+  uint32_t tcp_blocksize,nfiles,filenamesize,headersize,buffersize,serialized_int;
+
+  // Get parameters
+  port=atoi(argv[2]);
+  part=atoi(argv[3]);
 
   // Read HDF5 header
   h5=read_h5_header(argv[1]);
@@ -111,7 +127,7 @@ int main(int argc,char *argv[])
   // Allocate DMs and copy to device
   dm=(float *) malloc(sizeof(float)*ndm);
   for (idm=0;idm<ndm;idm++)
-    dm[idm]=0.5+(float) idm;
+    dm[idm]=34.5+(float) idm;
   checkCudaErrors(cudaMalloc((void **) &ddm,sizeof(float)*ndm));
   checkCudaErrors(cudaMemcpy(ddm,dm,sizeof(float)*ndm,cudaMemcpyHostToDevice));
 
@@ -131,14 +147,68 @@ int main(int argc,char *argv[])
   // Fix start time
   h5.tstart+=1800.0/86400.0;
 
-  // Allocate files
-  ofile=(FILE **) malloc(sizeof(FILE *)*ndm);
+  // Write temporary filterbank header
+  file[0]=fopen("header.fil","w");
+  write_filterbank_header(h5,file[0]);
+  fclose(file[0]);
+  file[0]=fopen("header.fil","r");
+  bytes_read=fread(fheader,sizeof(char),1024,file[0]);
+  fclose(file[0]);
+  
+  // Set up information for receiver
+  nfiles=4;
+  filenamesize=128;
+  headersize=bytes_read;
+  tcp_blocksize=8192;
+  buffersize=msamp*mchan;
 
-  // Format file names, open files and write headers
+  // Generate sockets
+  nskt=ndm/nfiles;
+  skt=(int *) malloc(sizeof(int)*nskt);
+
+  // Generate socket list (adjacent cDMs to same node
+  iskt=(int *) malloc(sizeof(int)*ndm);
+  for (idm=0;idm<ndm;idm++) 
+    iskt[idm]=idm/nfiles;
+  
+  // Connect
+  for (i=0;i<nskt;i++) {
+    // Set up socket
+    skt[i]=socket(AF_INET, SOCK_STREAM, 0);
+    addr.sin_family=AF_INET;
+    addr.sin_port=htons(port);
+    addr.sin_addr.s_addr = inet_addr(ip_address[i]);
+
+    if (connect(skt[i],(struct sockaddr *) &addr,sizeof(addr))<0) {
+      fprintf(stderr,"ERROR connecting to %s:%d\n",ip_address[i],port);
+      return -1;
+    } 
+    fprintf(stderr,"Connection opened to %s:%d\n",ip_address[i],port);
+
+    // Write info
+    serialized_int=htonl(nfiles);
+    write(skt[i],&serialized_int,sizeof(uint32_t));
+    serialized_int=htonl(filenamesize);
+    write(skt[i],&serialized_int,sizeof(uint32_t));
+    serialized_int=htonl(headersize);
+    write(skt[i],&serialized_int,sizeof(uint32_t));
+    serialized_int=htonl(tcp_blocksize);
+    write(skt[i],&serialized_int,sizeof(uint32_t));
+    serialized_int=htonl(buffersize);
+    write(skt[i],&serialized_int,sizeof(uint32_t));
+  }
+
+  // Format file names and send to receiver
   for (idm=0;idm<ndm;idm++) {
-    sprintf(fname,"cdmt_cDM%.2f.fil",dm[idm]);
-    ofile[idm]=fopen(fname,"w");
-    write_filterbank_header(h5,ofile[idm]);
+    // Send filename
+    sprintf(fname,"cdmt_cDM%06.2f_P%03d.fil",dm[idm],part);
+    write(skt[iskt[idm]],fname,128);
+  }
+  
+  // Send headers
+  for (idm=0;idm<ndm;idm++) {
+    // Send header
+    write(skt[iskt[idm]],fheader,bytes_read);
   }
 
   // Read files
@@ -217,14 +287,17 @@ int main(int argc,char *argv[])
       // Copy buffer to host
       checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan,cudaMemcpyDeviceToHost));
       // Write buffer
-      fwrite(cbuf,sizeof(unsigned char),nread*nsub,ofile[idm]);
+      for (i=0;i<nread*nsub;i+=tcp_blocksize)
+	write(skt[iskt[idm]],&cbuf[i],tcp_blocksize);
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
 
+  // Close sockets
+  for (i=0;i<nskt;i++)
+    close(skt[i]);
+
   // Close files
-  for (idm=0;idm<ndm;idm++)
-    fclose(ofile[idm]);
   for (i=0;i<4;i++)
     fclose(file[i]);
 
@@ -238,6 +311,9 @@ int main(int argc,char *argv[])
   free(fbuf);
   free(dm);
   free(cbuf);
+  free(iskt);
+  free(skt);
+
   cudaFree(dfbuf);
   cudaFree(dcbuf);
   cudaFree(cp1);
