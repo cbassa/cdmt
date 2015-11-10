@@ -44,7 +44,7 @@ void write_filterbank_header(struct header h,FILE *file);
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm=8;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm=40;
   int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
   char *header,*h5buf[4],*dh5buf[4];
   FILE *file[4];
@@ -61,7 +61,7 @@ int main(int argc,char *argv[])
   char fname[128],fheader[1024];
   int *skt,bytes_read;
   struct sockaddr_in addr;
-  const char *ip_address[2]={"10.168.139.1","10.168.140.1"};
+  const char *ip_address[]={"10.168.139.1","10.168.140.1","10.168.141.1","10.168.142.1","10.168.143.1","10.168.144.1","10.168.145.1","10.168.146.1","10.168.147.1","10.168.148.1"};
   int port=56000,part=2;
   int *iskt,nskt;
   uint32_t tcp_blocksize,nfiles,filenamesize,headersize,buffersize,serialized_int;
@@ -127,7 +127,7 @@ int main(int argc,char *argv[])
   // Allocate DMs and copy to device
   dm=(float *) malloc(sizeof(float)*ndm);
   for (idm=0;idm<ndm;idm++)
-    dm[idm]=34.5+(float) idm;
+    dm[idm]=20.5+(float) idm;
   checkCudaErrors(cudaMalloc((void **) &ddm,sizeof(float)*ndm));
   checkCudaErrors(cudaMemcpy(ddm,dm,sizeof(float)*ndm,cudaMemcpyHostToDevice));
 
