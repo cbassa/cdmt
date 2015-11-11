@@ -8,12 +8,14 @@
 //#include <sys/socket.h>
 #include <arpa/inet.h> 
 //#include <netinet/in.h>
-//#include <netdb.h>
+#include <netdb.h>
+#include<errno.h>
 #include <cuda.h>
 #include <cufft.h>
 #include <helper_functions.h>
 #include <helper_cuda.h>
-#include "hdf5.h"
+#include <getopt.h>
+#include <hdf5.h>
 
 #define HEADERSIZE 4096
 #define DMCONSTANT 2.41e-10
@@ -41,13 +43,23 @@ __global__ void compute_block_sums(float *z,int nchan,int nblock,int nsum,float 
 __global__ void compute_channel_statistics(int nchan,int nblock,int nsum,float *bs1,float *bs2,float *zavg,float *zstd);
 __global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
 void write_filterbank_header(struct header h,FILE *file);
+int hostname_to_ip(char * hostname , char* ip);
+int fgetline(FILE *file,char *s,int lim);
+
+
+void usage()
+{
+  printf("cdmt -n <file with list of nodes> -p <port> -P <part> -d <DM start,step,num> -D <GPU device> <file.h5>\n");
+
+  return;
+}
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm=40;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm;
   int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
   char *header,*h5buf[4],*dh5buf[4];
-  FILE *file[4];
+  FILE *rawfile[4],*file;
   unsigned char *cbuf,*dcbuf;
   float *fbuf,*dfbuf;
   float *bs1,*bs2,*zavg,*zstd;
@@ -57,21 +69,80 @@ int main(int argc,char *argv[])
   dim3 blocksize,gridsize;
   struct header h5;
   clock_t startclock;
-  float *dm,*ddm;
-  char fname[128],fheader[1024];
+  float *dm,*ddm,dm_start,dm_step;
+  char fname[128],fheader[1024],nodelist[128]="nodes.txt",hostname[64],*h5fname;
   int *skt,bytes_read;
   struct sockaddr_in addr;
-  const char *ip_address[]={"10.168.139.1","10.168.140.1","10.168.141.1","10.168.142.1","10.168.143.1","10.168.144.1","10.168.145.1","10.168.146.1","10.168.147.1","10.168.148.1"};
-  int port=56000,part=2;
+  char **ip_address;
+  int port=56000,part=0,device=0;
   int *iskt,nskt;
   uint32_t tcp_blocksize,nfiles,filenamesize,headersize,buffersize,serialized_int;
+  int arg=0;
 
-  // Get parameters
-  port=atoi(argv[2]);
-  part=atoi(argv[3]);
+  // Read options
+  if (argc>1) {
+    while ((arg=getopt(argc,argv,"n:p:P:d:D:h"))!=-1) {
+      switch (arg) {
+	
+      case 'n':
+	strcpy(nodelist,optarg);
+	break;
+	
+      case 'p':
+	port=atoi(optarg);
+	break;
+
+      case 'P':
+	part=atoi(optarg);
+	break;
+
+      case 'D':
+	device=atoi(optarg);
+	break;
+	
+      case 'd':
+	sscanf(optarg,"%f,%f,%d",&dm_start,&dm_step,&ndm);
+	break;
+
+      case 'h':
+	usage();
+	return 0;
+      }
+    }
+  } else {
+    usage();
+    return 0;
+  }
+  h5fname=argv[optind];
+  
+  // Resolve hosts
+  file=fopen(nodelist,"r");
+  if (file==NULL) {
+    fprintf(stderr,"Node list %s not found\n",nodelist);
+    return 0;
+  }
+
+  // Count sockets
+  nskt=0;
+  while (fgetline(file,hostname,64)>0) 
+    nskt++;
+  rewind(file);
+
+  // Allocate
+  skt=(int *) malloc(sizeof(int)*nskt);
+  ip_address=(char **) malloc(sizeof(char *)*nskt);
+  for (i=0;i<nskt;i++)
+    ip_address[i]=(char *) malloc(sizeof(char)*64);
+
+  // Resolve
+  for (i=0;i<nskt;i++) {
+    fgetline(file,hostname,64);
+    hostname_to_ip(hostname,ip_address[i]);
+  }
+  fclose(file);
 
   // Read HDF5 header
-  h5=read_h5_header(argv[1]);
+  h5=read_h5_header(h5fname);
 
   // Set number of subbands
   nsub=h5.nsub;
@@ -93,6 +164,9 @@ int main(int argc,char *argv[])
   mblock=msamp/msum;
 
   printf("nbin: %d nfft: %d nsub: %d mbin: %d nchan: %d nsamp: %d nvalid: %d\n",nbin,nfft,nsub,mbin,nchan,nsamp,nvalid);
+
+  // Set device
+  checkCudaErrors(cudaSetDevice(device));
 
   // Allocate memory for complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
@@ -127,7 +201,7 @@ int main(int argc,char *argv[])
   // Allocate DMs and copy to device
   dm=(float *) malloc(sizeof(float)*ndm);
   for (idm=0;idm<ndm;idm++)
-    dm[idm]=20.5+(float) idm;
+    dm[idm]=dm_start+(float) idm*dm_step;
   checkCudaErrors(cudaMalloc((void **) &ddm,sizeof(float)*ndm));
   checkCudaErrors(cudaMemcpy(ddm,dm,sizeof(float)*ndm,cudaMemcpyHostToDevice));
 
@@ -148,23 +222,20 @@ int main(int argc,char *argv[])
   h5.tstart+=1800.0/86400.0;
 
   // Write temporary filterbank header
-  file[0]=fopen("header.fil","w");
-  write_filterbank_header(h5,file[0]);
-  fclose(file[0]);
-  file[0]=fopen("header.fil","r");
-  bytes_read=fread(fheader,sizeof(char),1024,file[0]);
-  fclose(file[0]);
+  file=fopen("header.fil","w");
+  write_filterbank_header(h5,file);
+  fclose(file);
+  file=fopen("header.fil","r");
+  bytes_read=fread(fheader,sizeof(char),1024,file);
+  fclose(file);
   
   // Set up information for receiver
-  nfiles=4;
+  nfiles=(int) ceil(ndm/(float) nskt);
   filenamesize=128;
   headersize=bytes_read;
   tcp_blocksize=8192;
   buffersize=msamp*mchan;
-
-  // Generate sockets
-  nskt=ndm/nfiles;
-  skt=(int *) malloc(sizeof(int)*nskt);
+  printf("%d %d %d\n",nskt,ndm,nfiles);
 
   // Generate socket list (adjacent cDMs to same node
   iskt=(int *) malloc(sizeof(int)*ndm);
@@ -213,8 +284,8 @@ int main(int argc,char *argv[])
 
   // Read files
   for (i=0;i<4;i++) {
-    file[i]=fopen(h5.rawfname[i],"r");
-    fseek(file[i],7031250000,SEEK_SET);
+    rawfile[i]=fopen(h5.rawfname[i],"r");
+    fseek(rawfile[i],7031250000,SEEK_SET);
   }
 
   // Loop over input file contents
@@ -222,7 +293,7 @@ int main(int argc,char *argv[])
     // Read block
     startclock=clock();
     for (i=0;i<4;i++)
-      nread=fread(h5buf[i],sizeof(char),nsamp*nsub,file[i])/nsub;
+      nread=fread(h5buf[i],sizeof(char),nsamp*nsub,rawfile[i])/nsub;
     if (nread==0)
       break;
     printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
@@ -299,7 +370,7 @@ int main(int argc,char *argv[])
 
   // Close files
   for (i=0;i<4;i++)
-    fclose(file[i]);
+    fclose(rawfile[i]);
 
   // Free
   free(header);
@@ -313,6 +384,9 @@ int main(int argc,char *argv[])
   free(cbuf);
   free(iskt);
   free(skt);
+  for (i=0;i<nskt;i++)
+    free(ip_address[i]);
+  free(ip_address);
 
   cudaFree(dfbuf);
   cudaFree(dcbuf);
@@ -820,4 +894,42 @@ __global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,fl
   }
 
   return;
+}
+
+// Resolve hostname
+int hostname_to_ip(char * hostname , char* ip)
+{
+  struct hostent *he;
+  struct in_addr **addr_list;
+  int i;
+
+  // get the host info                                                                   
+  if ((he=gethostbyname(hostname))==NULL) {
+    herror("gethostbyname");
+    return 1;
+  }
+  addr_list=(struct in_addr **) he->h_addr_list;
+
+  //Return the first one;                                                                
+  for (i=0;addr_list[i]!=NULL;i++) {
+    strcpy(ip,inet_ntoa(*addr_list[i]));
+    return 0;
+  }
+
+  return 1;
+}
+
+// Read a line of maximum length int lim from file FILE into string s
+int fgetline(FILE *file,char *s,int lim)
+{
+  int c,i=0;
+
+  while (--lim > 0 && (c=fgetc(file)) != EOF && c != '\n')
+    s[i++] = c;
+  if (c == '\t')
+    c=' ';
+  //  if (c == '\n')
+  //    s[i++] = c;
+  s[i] = '\0';
+  return i;
 }
