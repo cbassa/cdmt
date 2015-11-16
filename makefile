@@ -20,6 +20,11 @@ cdmt.o: cdmt.cu
 codedisp: codedisp.cu
 	$(NVCC) $(CFLAGS) -o codedisp codedisp.cu $(LFLAGS)
 
+cdmt_rcvr: cdmt_rcvr.c
+	$(CC) -o cdmt_rcvr cdmt_rcvr.c
+
+cdmt_join: cdmt_join.c
+	$(CC) -o cdmt_join cdmt_join.c -lm
 
 
 clean:
