@@ -2,8 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <arpa/inet.h>
 #include <sys/types.h> 
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <getopt.h>
 
@@ -23,7 +26,7 @@ void error(const char *msg)
 
 int main(int argc, char *argv[])
 {
-  int sockfd,newsockfd;
+  int sockfd,newsockfd,*skt;
   socklen_t clilen;
   char *buffer,*header,*filename;
   struct sockaddr_in serv_addr, cli_addr;
@@ -76,6 +79,8 @@ int main(int argc, char *argv[])
   if (newsockfd<0) 
     error("ERROR on accept");
 
+  printf("New connection, socket fd is %d, ip is : %s, port : %d\n",newsockfd,inet_ntoa(cli_addr.sin_addr),ntohs(cli_addr.sin_port));
+
   // Read information
   bytes_read=read(newsockfd,&serialized_int,sizeof(uint32_t));
   nfiles=ntohl(serialized_int);
@@ -87,6 +92,15 @@ int main(int argc, char *argv[])
   blocksize=ntohl(serialized_int);
   bytes_read=read(newsockfd,&serialized_int,sizeof(uint32_t));
   buffersize=ntohl(serialized_int);
+
+  // Allocate sockets
+  skt=(int *) malloc(sizeof(int)*nfiles);
+  skt[0]=newsockfd;
+
+  for (i=1;i<nfiles;i++) {
+    skt[i]=accept(sockfd,(struct sockaddr *) &cli_addr,&clilen);
+    printf("New connection, socket fd is %d, ip is : %s, port : %d\n",skt[i],inet_ntoa(cli_addr.sin_addr),ntohs(cli_addr.sin_port));
+  }
 
   // Allocate buffer
   buffer=(char *) malloc(sizeof(char)*blocksize);
@@ -102,7 +116,7 @@ int main(int argc, char *argv[])
   // Read file names and open files
   for (i=0;i<nfiles;i++) {
     // Read filename
-    bytes_read=read(newsockfd,filename,filenamesize);
+    bytes_read=read(skt[i],filename,filenamesize);
 
     // Open file
     fp[i]=fopen(filename,"w");
@@ -110,14 +124,14 @@ int main(int argc, char *argv[])
 
   // Read headers
   for (i=0;i<nfiles;i++) {
-    bytes_read=read(newsockfd,header,headersize);
+    bytes_read=read(skt[i],header,headersize);
     fwrite(header,sizeof(char),bytes_read,fp[i]);
   }
 
   for (k=0;;k++) {
     for (i=0;i<nfiles;i++) {
       for (bytes_received=0;;) {
-	bytes_read=read(newsockfd,buffer,blocksize);
+	bytes_read=read(skt[i],buffer,blocksize);
 	if (bytes_read==0)
 	  break;
 	bytes_received+=bytes_read;
@@ -136,7 +150,8 @@ int main(int argc, char *argv[])
 
   // close sockets
   close(newsockfd);
-  close(sockfd);
+  for (i=0;i<nfiles;i++)
+    close(skt[i]);
 
   printf("receiver at port %d finished\n",port);
 

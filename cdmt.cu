@@ -75,7 +75,7 @@ int main(int argc,char *argv[])
   struct sockaddr_in addr;
   char **ip_address;
   int port=56000,part=0,device=0;
-  int *iskt,nskt;
+  int *iskt,nskt,nip;
   uint32_t tcp_blocksize,nfiles,filenamesize,headersize,buffersize,serialized_int;
   int arg=0;
 
@@ -123,19 +123,18 @@ int main(int argc,char *argv[])
   }
 
   // Count sockets
-  nskt=0;
+  nip=0;
   while (fgetline(file,hostname,64)>0) 
-    nskt++;
+    nip++;
   rewind(file);
 
   // Allocate
-  skt=(int *) malloc(sizeof(int)*nskt);
-  ip_address=(char **) malloc(sizeof(char *)*nskt);
-  for (i=0;i<nskt;i++)
+  ip_address=(char **) malloc(sizeof(char *)*nip);
+  for (i=0;i<nip;i++)
     ip_address[i]=(char *) malloc(sizeof(char)*64);
 
   // Resolve
-  for (i=0;i<nskt;i++) {
+  for (i=0;i<nip;i++) {
     fgetline(file,hostname,64);
     hostname_to_ip(hostname,ip_address[i]);
   }
@@ -230,17 +229,19 @@ int main(int argc,char *argv[])
   fclose(file);
   
   // Set up information for receiver
-  nfiles=(int) ceil(ndm/(float) nskt);
+  nfiles=(int) ceil(ndm/(float) nip);
+  nskt=ndm;
   filenamesize=128;
   headersize=bytes_read;
   tcp_blocksize=8192;
   buffersize=msamp*mchan;
-  printf("%d %d %d\n",nskt,ndm,nfiles);
+  printf("%d sockets, %d dms, %d files\n",nskt,ndm,nfiles);
 
   // Generate socket list (adjacent cDMs to same node
+  skt=(int *) malloc(sizeof(int)*nskt);
   iskt=(int *) malloc(sizeof(int)*ndm);
-  for (idm=0;idm<ndm;idm++) 
-    iskt[idm]=idm/nfiles;
+  for (i=0;i<nskt;i++) 
+    iskt[i]=i/nfiles;
   
   // Connect
   for (i=0;i<nskt;i++) {
@@ -248,38 +249,40 @@ int main(int argc,char *argv[])
     skt[i]=socket(AF_INET, SOCK_STREAM, 0);
     addr.sin_family=AF_INET;
     addr.sin_port=htons(port);
-    addr.sin_addr.s_addr = inet_addr(ip_address[i]);
+    addr.sin_addr.s_addr = inet_addr(ip_address[iskt[i]]);
 
     if (connect(skt[i],(struct sockaddr *) &addr,sizeof(addr))<0) {
-      fprintf(stderr,"ERROR connecting to %s:%d\n",ip_address[i],port);
+      fprintf(stderr,"ERROR connecting to %s:%d\n",ip_address[iskt[i]],port);
       return -1;
     } 
-    fprintf(stderr,"Connection opened to %s:%d\n",ip_address[i],port);
+    fprintf(stderr,"Connection opened to %s:%d (socket %d)\n",ip_address[iskt[i]],port,skt[i]);
 
-    // Write info
-    serialized_int=htonl(nfiles);
-    write(skt[i],&serialized_int,sizeof(uint32_t));
-    serialized_int=htonl(filenamesize);
-    write(skt[i],&serialized_int,sizeof(uint32_t));
-    serialized_int=htonl(headersize);
-    write(skt[i],&serialized_int,sizeof(uint32_t));
-    serialized_int=htonl(tcp_blocksize);
-    write(skt[i],&serialized_int,sizeof(uint32_t));
-    serialized_int=htonl(buffersize);
-    write(skt[i],&serialized_int,sizeof(uint32_t));
+    // Write info to each IP
+    if (i%nfiles==0) {
+      serialized_int=htonl(nfiles);
+      write(skt[i],&serialized_int,sizeof(uint32_t));
+      serialized_int=htonl(filenamesize);
+      write(skt[i],&serialized_int,sizeof(uint32_t));
+      serialized_int=htonl(headersize);
+      write(skt[i],&serialized_int,sizeof(uint32_t));
+      serialized_int=htonl(tcp_blocksize);
+      write(skt[i],&serialized_int,sizeof(uint32_t));
+      serialized_int=htonl(buffersize);
+      write(skt[i],&serialized_int,sizeof(uint32_t));
+    }
   }
 
   // Format file names and send to receiver
   for (idm=0;idm<ndm;idm++) {
     // Send filename
     sprintf(fname,"cdmt_cDM%06.2f_P%03d.fil",dm[idm],part);
-    write(skt[iskt[idm]],fname,128);
+    write(skt[idm],fname,128);
   }
   
   // Send headers
   for (idm=0;idm<ndm;idm++) {
     // Send header
-    write(skt[iskt[idm]],fheader,bytes_read);
+    write(skt[idm],fheader,bytes_read);
   }
 
   // Read files
@@ -358,8 +361,9 @@ int main(int argc,char *argv[])
       // Copy buffer to host
       checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan,cudaMemcpyDeviceToHost));
       // Write buffer
+      printf("Sending %d bytes to socket %d\n",nread*nsub,skt[idm]);
       for (i=0;i<nread*nsub;i+=tcp_blocksize)
-	write(skt[iskt[idm]],&cbuf[i],tcp_blocksize);
+	write(skt[idm],&cbuf[i],tcp_blocksize);
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
@@ -384,7 +388,7 @@ int main(int argc,char *argv[])
   free(cbuf);
   free(iskt);
   free(skt);
-  for (i=0;i<nskt;i++)
+  for (i=0;i<nip;i++)
     free(ip_address[i]);
   free(ip_address);
 
