@@ -4,7 +4,10 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <time.h>
-#include <omp.h>
+#include <cuda.h>
+#include <helper_functions.h>
+#include <helper_cuda.h>
+
 
 struct header {
   int64_t headersize,buffersize;
@@ -24,20 +27,41 @@ void usage(void)
   return;
 }
 
+// Reordering kernel
+__global__ void reorder(unsigned char *obuf,unsigned char *ibuf,int64_t nsamp,int64_t nchan,int64_t ipart,int64_t npart)
+{
+  int64_t isamp,ichan,idx1,idx2;
+
+  // Indices of input data
+  isamp=blockIdx.x*blockDim.x+threadIdx.x;
+  ichan=blockIdx.y*blockDim.y+threadIdx.y;
+
+  // Compute valid threads
+  if (isamp<nsamp && ichan<nchan) {
+    idx1=ichan+isamp*nchan;
+    idx2=ichan+ipart*nchan+isamp*npart*nchan;
+    obuf[idx2]=ibuf[idx1];
+  }
+
+  return;
+}
+
+
 int main(int argc,char *argv[])
 {
-  int64_t ipart,isamp,ichan,idx1,idx2;
-  int64_t npart,nsamp=5000000,nsampread,nchan;
+  int64_t ipart,npart,nsamp=5000000,nsampread,nchan;
   FILE **file,*ofile;
   char *ofname;
   struct header *h;
   unsigned char *ibuf,*obuf;
+  unsigned char *dibuf,*dobuf;
   clock_t startclock;
-  int arg=0;
+  int arg=0,device=0;
+  dim3 blocksize,gridsize;
 
   // Decode options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"o:h"))!=-1) {
+    while ((arg=getopt(argc,argv,"o:hd:"))!=-1) {
       switch(arg) {
 
       case 'o':
@@ -47,6 +71,10 @@ int main(int argc,char *argv[])
       case 'h':
 	usage();
 	return 0;
+
+      case 'd':
+	device=atoi(optarg);
+	break;
 
       default:
 	usage();
@@ -93,44 +121,48 @@ int main(int argc,char *argv[])
   h[0].nchan*=npart;
   write_header(h[0],ofile);
 
+  // Set device                                                                            
+  checkCudaErrors(cudaSetDevice(device));
+
   // Allocate buffers
   ibuf=(unsigned char *) malloc(sizeof(unsigned char)*nchan*nsamp); 
   obuf=(unsigned char *) malloc(sizeof(unsigned char)*nchan*nsamp*npart); 
-
+  checkCudaErrors(cudaMalloc((void **) &dibuf,sizeof(unsigned char)*nchan*nsamp));
+  checkCudaErrors(cudaMalloc((void **) &dobuf,sizeof(unsigned char)*nchan*nsamp*npart));
 
   // Loop over blocks
   for (;;) {
     // Loop over files
+    startclock=clock();
     for (ipart=0;ipart<npart;ipart++) {
-      startclock=clock();
       nsampread=fread(ibuf,sizeof(unsigned char),nchan*nsamp,file[ipart])/nchan;
-      printf("Read %d MB in %.2f s\n",nsampread*nchan*sizeof(unsigned char)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
       // Break if file empty
       if (nsampread==0)
 	break;
 
-      // Copy input buffer into output buffer
-      startclock=clock();
-#pragma omp parallel for
-      for (isamp=0;isamp<nsampread;isamp++) {
-	for (ichan=0;ichan<nchan;ichan++) {
-	  idx1=ichan+isamp*nchan;
-	  idx2=ichan+ipart*nchan+isamp*npart*nchan;
-	  obuf[idx2]=ibuf[idx1];
-	}
-      }
-      printf("Copied %d MB in %.2f s\n",nsampread*nchan*sizeof(unsigned char)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
+      // Copy input buffer to GPU
+      checkCudaErrors(cudaMemcpy(dibuf,ibuf,sizeof(unsigned char)*nchan*nsampread,cudaMemcpyHostToDevice));
+
+      // Reorder buffer
+      blocksize.x=256;blocksize.y=4;blocksize.z=1;
+      gridsize.x=nsampread/blocksize.x+1;gridsize.y=nchan/blocksize.y+1;gridsize.z=1;
+      reorder<<<gridsize,blocksize>>>(dobuf,dibuf,nsampread,nchan,ipart,npart);
     }
+    // Break if file empty
+    if (nsampread==0)
+      break;
+
+    printf("Read and reordered %d MB in %.2f s\n",nsampread*nchan*npart*sizeof(unsigned char)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
+
+    // Copy output buffer to host
+    checkCudaErrors(cudaMemcpy(obuf,dobuf,sizeof(unsigned char)*nchan*nsampread*npart,cudaMemcpyDeviceToHost));
 
     // Write buffer
     startclock=clock();
     fwrite(obuf,sizeof(unsigned char),nchan*npart*nsampread,ofile);
     printf("Wrote %d MB in %.2f s\n",nsampread*nchan*npart*sizeof(unsigned char)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
-    // Break if file empty
-    if (nsampread==0)
-      break;
   }
 
   // Close files
@@ -143,6 +175,8 @@ int main(int argc,char *argv[])
   free(h);
   free(ibuf);
   free(obuf);
+  cudaFree(dobuf);
+  cudaFree(dibuf);
 
   return 0;
 }
