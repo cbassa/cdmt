@@ -49,7 +49,7 @@ int fgetline(FILE *file,char *s,int lim);
 
 void usage()
 {
-  printf("cdmt -n <file with list of nodes> -p <port> -P <part> -d <DM start,step,num> -D <GPU device> <file.h5>\n");
+  printf("cdmt -n <file with list of nodes> -p <port> -P <part> -d <DM start,step,num> -D <GPU device> -o <outputname> <file.h5>\n");
 
   return;
 }
@@ -70,7 +70,7 @@ int main(int argc,char *argv[])
   struct header h5;
   clock_t startclock;
   float *dm,*ddm,dm_start,dm_step;
-  char fname[128],fheader[1024],nodelist[128]="nodes.txt",hostname[64],*h5fname;
+  char fname[128],fheader[1024],nodelist[128]="nodes.txt",hostname[64],*h5fname,obsid[128]="cdmt";
   int *skt,bytes_read;
   struct sockaddr_in addr;
   char **ip_address;
@@ -81,11 +81,15 @@ int main(int argc,char *argv[])
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"n:p:P:d:D:h"))!=-1) {
+    while ((arg=getopt(argc,argv,"n:p:P:d:D:ho:"))!=-1) {
       switch (arg) {
 	
       case 'n':
 	strcpy(nodelist,optarg);
+	break;
+
+      case 'o':
+	strcpy(obsid,optarg);
 	break;
 	
       case 'p':
@@ -218,7 +222,7 @@ int main(int argc,char *argv[])
   compute_chirp<<<gridsize,blocksize>>>(h5.fcen,nsub*h5.bwchan,ddm,nchan,nbin,nsub,ndm,dc);
 
   // Fix start time
-  h5.tstart+=1800.0/86400.0;
+  //  h5.tstart+=1800.0/86400.0;
 
   // Write temporary filterbank header
   file=fopen("header.fil","w");
@@ -275,7 +279,7 @@ int main(int argc,char *argv[])
   // Format file names and send to receiver
   for (idm=0;idm<ndm;idm++) {
     // Send filename
-    sprintf(fname,"cdmt_cDM%06.2f_P%03d.fil",dm[idm],part);
+    sprintf(fname,"%s_cDM%06.2f_P%03d.fil",obsid,dm[idm],part);
     write(skt[idm],fname,128);
   }
   
@@ -288,11 +292,12 @@ int main(int argc,char *argv[])
   // Read files
   for (i=0;i<4;i++) {
     rawfile[i]=fopen(h5.rawfname[i],"r");
-    fseek(rawfile[i],7031250000,SEEK_SET);
+    //    fseek(rawfile[i],7031250000,SEEK_SET);
   }
 
   // Loop over input file contents
-  for (iblock=0;iblock<40;iblock++) {
+  //  for (iblock=0;iblock<40;iblock++) {
+  for (iblock=0;;iblock++) {
     // Read block
     startclock=clock();
     for (i=0;i<4;i++)
@@ -361,7 +366,8 @@ int main(int argc,char *argv[])
       // Copy buffer to host
       checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan,cudaMemcpyDeviceToHost));
       // Write buffer
-      printf("Sending %d bytes to socket %d\n",nread*nsub,skt[idm]);
+      serialized_int=htonl(nread*nsub);
+      write(skt[idm],&serialized_int,sizeof(uint32_t));
       for (i=0;i<nread*nsub;i+=tcp_blocksize)
 	write(skt[idm],&cbuf[i],tcp_blocksize);
     }
@@ -416,12 +422,12 @@ int main(int argc,char *argv[])
 // error checking is done.
 struct header read_h5_header(char *fname)
 {
-  int i,len;
+  int i,len,ibeam,isap;
   struct header h;
   hid_t file_id,attr_id,sap_id,beam_id,memtype,group_id,space,coord_id;
   char *string,*pch;
   const char *stokes[]={"_S0_","_S1_","_S2_","_S3_"};
-  char *froot,*fpart,*ftest;
+  char *froot,*fpart,*ftest,group[32];
   FILE *file;
 
   // Find filenames
@@ -453,6 +459,22 @@ struct header read_h5_header(char *fname)
     strcpy(h.rawfname[i],ftest);
   }
 
+  // Get beam number
+  for (i=0;i<4;i++) {
+    pch=strstr(fname,"_B");
+    if (pch!=NULL)
+      break;
+  }
+  sscanf(pch+2,"%d",&ibeam);
+
+  // Get SAP number
+  for (i=0;i<4;i++) {
+    pch=strstr(fname,"_SAP");
+    if (pch!=NULL)
+      break;
+  }
+  sscanf(pch+4,"%d",&isap);
+
   // Free
   free(froot);
   free(fpart);
@@ -462,7 +484,8 @@ struct header read_h5_header(char *fname)
   file_id=H5Fopen(fname,H5F_ACC_RDONLY,H5P_DEFAULT);
 
   // Open subarray pointing group
-  sap_id=H5Gopen(file_id,"SUB_ARRAY_POINTING_000",H5P_DEFAULT);
+  sprintf(group,"SUB_ARRAY_POINTING_%03d",isap);
+  sap_id=H5Gopen(file_id,group,H5P_DEFAULT);
 
   // Start MJD
   attr_id=H5Aopen(sap_id,"EXPTIME_START_MJD",H5P_DEFAULT);
@@ -479,8 +502,9 @@ struct header read_h5_header(char *fname)
   H5Aread(attr_id,H5T_IEEE_F64LE,&h.src_raj);
   H5Aclose(attr_id);
 
-  // Open beam 0
-  beam_id=H5Gopen(sap_id,"BEAM_000",H5P_DEFAULT);
+  // Open beam
+  sprintf(group,"BEAM_%03d",ibeam);
+  beam_id=H5Gopen(sap_id,group,H5P_DEFAULT);
 
   // Number of samples
   attr_id=H5Aopen(beam_id,"NOF_SAMPLES",H5P_DEFAULT);

@@ -130,13 +130,18 @@ int main(int argc, char *argv[])
 
   for (k=0;;k++) {
     for (i=0;i<nfiles;i++) {
+      // Get size of buffer to read
+      bytes_read=read(skt[i],&serialized_int,sizeof(uint32_t));
+      buffersize=ntohl(serialized_int);
+
+      // Receive buffer
       for (bytes_received=0;;) {
 	bytes_read=read(skt[i],buffer,blocksize);
 	if (bytes_read==0)
 	  break;
 	bytes_received+=bytes_read;
 	fwrite(buffer,sizeof(char),bytes_read,fp[i]);
-	if (bytes_received==buffersize)
+	if (bytes_received>=buffersize)
 	  break;
       }
     }

@@ -58,6 +58,7 @@ int main(int argc,char *argv[])
   clock_t startclock;
   int arg=0,device=0;
   dim3 blocksize,gridsize;
+  float tread=0.0,treorder=0.0,twrite=0.0,tcopy=0.0;
 
   // Decode options
   if (argc>1) {
@@ -133,37 +134,43 @@ int main(int argc,char *argv[])
   // Loop over blocks
   for (;;) {
     // Loop over files
-    startclock=clock();
     for (ipart=0;ipart<npart;ipart++) {
+      startclock=clock();
       nsampread=fread(ibuf,sizeof(unsigned char),nchan*nsamp,file[ipart])/nchan;
+      tread+=(float) (clock()-startclock)/CLOCKS_PER_SEC;
 
       // Break if file empty
       if (nsampread==0)
 	break;
 
       // Copy input buffer to GPU
+      startclock=clock();
       checkCudaErrors(cudaMemcpy(dibuf,ibuf,sizeof(unsigned char)*nchan*nsampread,cudaMemcpyHostToDevice));
+      tcopy+=(float) (clock()-startclock)/CLOCKS_PER_SEC;
 
       // Reorder buffer
       blocksize.x=256;blocksize.y=4;blocksize.z=1;
       gridsize.x=nsampread/blocksize.x+1;gridsize.y=nchan/blocksize.y+1;gridsize.z=1;
+      startclock=clock();
       reorder<<<gridsize,blocksize>>>(dobuf,dibuf,nsampread,nchan,ipart,npart);
+      checkCudaErrors(cudaDeviceSynchronize());
+      treorder+=(float) (clock()-startclock)/CLOCKS_PER_SEC;
     }
     // Break if file empty
     if (nsampread==0)
       break;
 
-    printf("Read and reordered %d MB in %.2f s\n",nsampread*nchan*npart*sizeof(unsigned char)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
-
     // Copy output buffer to host
+    startclock=clock();
     checkCudaErrors(cudaMemcpy(obuf,dobuf,sizeof(unsigned char)*nchan*nsampread*npart,cudaMemcpyDeviceToHost));
+    tcopy+=(float) (clock()-startclock)/CLOCKS_PER_SEC;
 
     // Write buffer
     startclock=clock();
     fwrite(obuf,sizeof(unsigned char),nchan*npart*nsampread,ofile);
-    printf("Wrote %d MB in %.2f s\n",nsampread*nchan*npart*sizeof(unsigned char)/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
-
+    twrite+=(float) (clock()-startclock)/CLOCKS_PER_SEC;
   }
+  printf("Reading %.2f s, writing: %.2f s, GPU copy, %.2f s, GPU process: %.2f s\n",tread,twrite,tcopy,treorder);
 
   // Close files
   for (ipart=0;ipart<npart;ipart++)
