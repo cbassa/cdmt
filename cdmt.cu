@@ -56,8 +56,8 @@ void usage()
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm;
-  int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=8192,nsub=20,ndm;
+  int idm,iblock,nread,mchan,msamp,mblock,msum=1024,nwrite;
   char *header,*h5buf[4],*dh5buf[4];
   FILE *rawfile[4],*file;
   unsigned char *cbuf,*dcbuf;
@@ -221,9 +221,6 @@ int main(int argc,char *argv[])
   gridsize.x=nsub/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=ndm/blocksize.z+1;
   compute_chirp<<<gridsize,blocksize>>>(h5.fcen,nsub*h5.bwchan,ddm,nchan,nbin,nsub,ndm,dc);
 
-  // Fix start time
-  //  h5.tstart+=1800.0/86400.0;
-
   // Write temporary filterbank header
   file=fopen("header.fil","w");
   write_filterbank_header(h5,file);
@@ -251,6 +248,11 @@ int main(int argc,char *argv[])
   for (i=0;i<nskt;i++) {
     // Set up socket
     skt[i]=socket(AF_INET, SOCK_STREAM, 0);
+    if (skt[i]<0) {
+      fprintf(stderr,"ERROR opening socket\n");
+      return -1;
+    } 
+
     addr.sin_family=AF_INET;
     addr.sin_port=htons(port);
     addr.sin_addr.s_addr = inet_addr(ip_address[iskt[i]]);
@@ -292,11 +294,9 @@ int main(int argc,char *argv[])
   // Read files
   for (i=0;i<4;i++) {
     rawfile[i]=fopen(h5.rawfname[i],"r");
-    //    fseek(rawfile[i],7031250000,SEEK_SET);
   }
 
   // Loop over input file contents
-  //  for (iblock=0;iblock<40;iblock++) {
   for (iblock=0;;iblock++) {
     // Read block
     startclock=clock();
@@ -368,8 +368,11 @@ int main(int argc,char *argv[])
       // Write buffer
       serialized_int=htonl(nread*nsub);
       write(skt[idm],&serialized_int,sizeof(uint32_t));
-      for (i=0;i<nread*nsub;i+=tcp_blocksize)
-	write(skt[idm],&cbuf[i],tcp_blocksize);
+      for (i=0;i<nread*nsub;i+=tcp_blocksize) {
+	nwrite=write(skt[idm],&cbuf[i],tcp_blocksize);
+	if (nwrite!=tcp_blocksize)
+	  printf("bla iblock; %d i; %d bytes written: %d\n",iblock,i,nwrite);
+      }
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }

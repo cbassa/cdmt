@@ -23,11 +23,11 @@ codedisp: codedisp.cu
 cdmt_rcvr: cdmt_rcvr.c
 	$(CC) -o cdmt_rcvr cdmt_rcvr.c
 
-cdmt_join: cdmt_join.cu
-	$(NVCC) $(CFLAGS) -o cdmt_join cdmt_join.cu -lm $(LFLAGS)
+#cdmt_join: cdmt_join.cu
+#	$(NVCC) $(CFLAGS) -o cdmt_join cdmt_join.cu -lm $(LFLAGS)
 
-#cdmt_join: cdmt_join.c
-#	$(CC) -o cdmt_join cdmt_join.c -lm
+cdmt_join: cdmt_join.c
+	$(CC) -o cdmt_join cdmt_join.c -lm
 
 
 clean:

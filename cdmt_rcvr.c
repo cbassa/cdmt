@@ -33,7 +33,7 @@ int main(int argc, char *argv[])
   int bytes_read,bytes_received;
   FILE **fp;
   int port=56000;
-  int arg;
+  int arg,so_reuse=1;
   int i,j,k;
   uint32_t blocksize,nfiles,filenamesize,headersize,buffersize,serialized_int;
 
@@ -60,12 +60,19 @@ int main(int argc, char *argv[])
   sockfd=socket(AF_INET,SOCK_STREAM,0);
   if (sockfd<0) 
     error("ERROR opening socket");
+
   bzero((char *) &serv_addr,sizeof(serv_addr));
   serv_addr.sin_family=AF_INET;
   serv_addr.sin_addr.s_addr=INADDR_ANY;
   serv_addr.sin_port=htons(port);
+
+  // Set socket reuse
+  if (setsockopt(sockfd,SOL_SOCKET,SO_REUSEADDR,&so_reuse,sizeof(int))<0)
+    error("ERROR reusing socket");
+
+  // Bind to socket
   if (bind(sockfd,(struct sockaddr *) &serv_addr,sizeof(serv_addr))<0) 
-    error("ERROR on binding!");
+    error("ERROR on binding");
   
   // Listen to socket
   if (listen(sockfd,5)<0)
