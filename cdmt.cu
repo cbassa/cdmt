@@ -4,11 +4,6 @@
 #include <unistd.h>
 #include <math.h>
 #include <time.h>
-//#include <sys/types.h>
-//#include <sys/socket.h>
-#include <arpa/inet.h> 
-//#include <netinet/in.h>
-#include <netdb.h>
 #include<errno.h>
 #include <cuda.h>
 #include <cufft.h>
@@ -20,6 +15,7 @@
 #define HEADERSIZE 4096
 #define DMCONSTANT 2.41e-10
 
+// Struct for header information
 struct header {
   int64_t headersize,buffersize;
   unsigned int nchan,nsamp,nbit,nif,nsub;
@@ -44,20 +40,26 @@ __global__ void compute_channel_statistics(int nchan,int nblock,int nsum,float *
 __global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
 __global__ void decimate_and_redigitize(float *z,int ndec,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
 void write_filterbank_header(struct header h,FILE *file);
-int hostname_to_ip(char * hostname , char* ip);
-int fgetline(FILE *file,char *s,int lim);
 
-
+// Usage
 void usage()
 {
-  printf("cdmt -n <file with list of nodes> -p <port> -P <part> -d <DM start,step,num> -D <GPU device> -o <outputname> <file.h5>\n");
+  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -b <ndec> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
+  printf("Compute coherently dedispersed SIGPROC filterbank files from LOFAR complex voltage data in HDF5 format.\n");
+  printf("-P <part>        Specify part number for input file [integer, default: 0]\n");
+  printf("-D <GPU device>  Select GPU device [integer, default: 0]\n");
+  printf("-b <ndec>        Number of time samples to average [integer, default: 1]\n");
+  printf("-d <DM start, step, num>  DM start and stepsize, number of DM trials\n");
+  printf("-o <outputname>           Output filename [default: cdmt]\n");
+  printf("-N <forward FFT size>     Forward FFT size [integer, default: 65536]\n");
+  printf("-n <overlap region>       Overlap region [integer, default: 2048]\n");
 
   return;
 }
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=8192,nsub=20,ndm,ndec=1;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm,ndec=1;
   int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
   char *header,*h5buf[4],*dh5buf[4];
   FILE *rawfile[4],*file;
@@ -71,22 +73,23 @@ int main(int argc,char *argv[])
   struct header h5;
   clock_t startclock;
   float *dm,*ddm,dm_start,dm_step;
-  char fname[128],fheader[1024],nodelist[128]="nodes.txt",hostname[64],*h5fname,obsid[128]="cdmt";
-  int *skt,bytes_read;
-  struct sockaddr_in addr;
-  char **ip_address;
-  int port=56000,part=0,device=0;
-  int *iskt,nskt,nip,so_reuse=1;
-  uint32_t tcp_blocksize,nfiles,filenamesize,headersize,buffersize,serialized_int;
+  char fname[128],fheader[1024],*h5fname,obsid[128]="cdmt";
+  int bytes_read;
+  int part=0,device=0;
   int arg=0;
+  FILE **outfile;
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"n:p:P:d:D:ho:b:"))!=-1) {
+    while ((arg=getopt(argc,argv,"P:d:D:ho:b:N:n:"))!=-1) {
       switch (arg) {
 	
       case 'n':
-	strcpy(nodelist,optarg);
+	noverlap=atoi(optarg);
+	break;
+
+      case 'N':
+	nbin=atoi(optarg);
 	break;
 
       case 'b':
@@ -97,10 +100,6 @@ int main(int argc,char *argv[])
 	strcpy(obsid,optarg);
 	break;
 	
-      case 'p':
-	port=atoi(optarg);
-	break;
-
       case 'P':
 	part=atoi(optarg);
 	break;
@@ -124,33 +123,9 @@ int main(int argc,char *argv[])
   }
   h5fname=argv[optind];
   
-  // Resolve hosts
-  file=fopen(nodelist,"r");
-  if (file==NULL) {
-    fprintf(stderr,"Node list %s not found\n",nodelist);
-    return 0;
-  }
-
-  // Count sockets
-  nip=0;
-  while (fgetline(file,hostname,64)>0) 
-    nip++;
-  rewind(file);
-
-  // Allocate
-  ip_address=(char **) malloc(sizeof(char *)*nip);
-  for (i=0;i<nip;i++)
-    ip_address[i]=(char *) malloc(sizeof(char)*64);
-
-  // Resolve
-  for (i=0;i<nip;i++) {
-    fgetline(file,hostname,64);
-    hostname_to_ip(hostname,ip_address[i]);
-  }
-  fclose(file);
-
   // Read HDF5 header
   h5=read_h5_header(h5fname);
+
 
   // Set number of subbands
   nsub=h5.nsub;
@@ -227,77 +202,25 @@ int main(int argc,char *argv[])
   compute_chirp<<<gridsize,blocksize>>>(h5.fcen,nsub*h5.bwchan,ddm,nchan,nbin,nsub,ndm,dc);
 
   // Write temporary filterbank header
-  file=fopen("header.fil","w");
+  file=fopen("/tmp/header.fil","w");
   write_filterbank_header(h5,file);
   fclose(file);
-  file=fopen("header.fil","r");
+  file=fopen("/tmp/header.fil","r");
   bytes_read=fread(fheader,sizeof(char),1024,file);
   fclose(file);
   
-  // Set up information for receiver
-  nfiles=(int) ceil(ndm/(float) nip);
-  nskt=ndm;
-  filenamesize=128;
-  headersize=bytes_read;
-  tcp_blocksize=8192;
-  buffersize=msamp*mchan/ndec;
-  printf("%d sockets, %d dms, %d files\n",nskt,ndm,nfiles);
-
-  // Generate socket list (adjacent cDMs to same node
-  skt=(int *) malloc(sizeof(int)*nskt);
-  iskt=(int *) malloc(sizeof(int)*ndm);
-  for (i=0;i<nskt;i++) 
-    iskt[i]=i/nfiles;
-  
-  // Connect
-  for (i=0;i<nskt;i++) {
-    // Set up socket
-    skt[i]=socket(AF_INET, SOCK_STREAM, 0);
-    if (skt[i]<0) {
-      fprintf(stderr,"ERROR opening socket\n");
-      return -1;
-    } 
-    if (setsockopt(skt[i],SOL_SOCKET,SO_REUSEADDR,&so_reuse,sizeof(int))<0) {
-      fprintf(stderr,"ERROR reusing socket\n");
-      return -1;
-    }
-
-    addr.sin_family=AF_INET;
-    addr.sin_port=htons(port);
-    addr.sin_addr.s_addr = inet_addr(ip_address[iskt[i]]);
-
-    if (connect(skt[i],(struct sockaddr *) &addr,sizeof(addr))<0) {
-      fprintf(stderr,"ERROR connecting to %s:%d\n",ip_address[iskt[i]],port);
-      return -1;
-    } 
-    fprintf(stderr,"Connection opened to %s:%d (socket %d)\n",ip_address[iskt[i]],port,skt[i]);
-
-    // Write info to each IP
-    if (i%nfiles==0) {
-      serialized_int=htonl(nfiles);
-      write(skt[i],&serialized_int,sizeof(uint32_t));
-      serialized_int=htonl(filenamesize);
-      write(skt[i],&serialized_int,sizeof(uint32_t));
-      serialized_int=htonl(headersize);
-      write(skt[i],&serialized_int,sizeof(uint32_t));
-      serialized_int=htonl(tcp_blocksize);
-      write(skt[i],&serialized_int,sizeof(uint32_t));
-      serialized_int=htonl(buffersize);
-      write(skt[i],&serialized_int,sizeof(uint32_t));
-    }
-  }
-
-  // Format file names and send to receiver
+  // Format file names and open
+  outfile=(FILE **) malloc(sizeof(FILE *)*ndm);
   for (idm=0;idm<ndm;idm++) {
-    // Send filename
     sprintf(fname,"%s_cDM%06.2f_P%03d.fil",obsid,dm[idm],part);
-    write(skt[idm],fname,128);
+
+    outfile[idm]=fopen(fname,"w");
   }
   
-  // Send headers
+  // Write headers
   for (idm=0;idm<ndm;idm++) {
     // Send header
-    write(skt[idm],fheader,bytes_read);
+    fwrite(fheader,sizeof(char),bytes_read,outfile[idm]);
   }
 
   // Read files
@@ -306,7 +229,6 @@ int main(int argc,char *argv[])
   }
 
   // Loop over input file contents
-  //  for (iblock=0;iblock<40;iblock++) {
   for (iblock=0;;iblock++) {
     // Read block
     startclock=clock();
@@ -380,17 +302,14 @@ int main(int argc,char *argv[])
       checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan/ndec,cudaMemcpyDeviceToHost));
 
       // Write buffer
-      serialized_int=htonl(nread*nsub/ndec);
-      write(skt[idm],&serialized_int,sizeof(uint32_t));
-      for (i=0;i<nread*nsub/ndec;i+=tcp_blocksize)
-	write(skt[idm],&cbuf[i],tcp_blocksize);
+      fwrite(cbuf,sizeof(char),nread*nsub/ndec,outfile[idm]);
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
 
-  // Close sockets
-  for (i=0;i<nskt;i++)
-    close(skt[i]);
+  // Close files
+  for (i=0;i<ndm;i++)
+    fclose(outfile[i]);
 
   // Close files
   for (i=0;i<4;i++)
@@ -406,11 +325,7 @@ int main(int argc,char *argv[])
   free(fbuf);
   free(dm);
   free(cbuf);
-  free(iskt);
-  free(skt);
-  for (i=0;i<nip;i++)
-    free(ip_address[i]);
-  free(ip_address);
+  free(outfile);
 
   cudaFree(dfbuf);
   cudaFree(dcbuf);
@@ -451,9 +366,9 @@ struct header read_h5_header(char *fname)
       break;
   }
   len=strlen(fname)-strlen(pch);
-  froot=(char *) malloc(sizeof(char)*len);
-  fpart=(char *) malloc(sizeof(char)*(strlen(pch)-7));
-  ftest=(char *) malloc(sizeof(char)*(len+10));
+  froot=(char *) malloc(sizeof(char)*(len+1));
+  fpart=(char *) malloc(sizeof(char)*(strlen(pch)-6));
+  ftest=(char *) malloc(sizeof(char)*(len+20));
   strncpy(froot,fname,len);
   strncpy(fpart,pch+4,strlen(pch)-7);
 
@@ -461,7 +376,6 @@ struct header read_h5_header(char *fname)
   for (i=0;i<4;i++) {
     // Format file name
     sprintf(ftest,"%s_S%d_%s.raw",froot,i,fpart);
-
     // Try to open
     if ((file=fopen(ftest,"r"))!=NULL) {
       fclose(file);
@@ -469,7 +383,7 @@ struct header read_h5_header(char *fname)
       fprintf(stderr,"Raw file %s not found\n",ftest);
       exit (-1);
     }
-    h.rawfname[i]=(char *) malloc(sizeof(char)*strlen(ftest));
+    h.rawfname[i]=(char *) malloc(sizeof(char)*(strlen(ftest)+1));
     strcpy(h.rawfname[i],ftest);
   }
 
@@ -966,42 +880,4 @@ __global__ void decimate_and_redigitize(float *z,int ndec,int nchan,int nblock,i
   }
 
   return;
-}
-
-// Resolve hostname
-int hostname_to_ip(char * hostname , char* ip)
-{
-  struct hostent *he;
-  struct in_addr **addr_list;
-  int i;
-
-  // get the host info                                                                   
-  if ((he=gethostbyname(hostname))==NULL) {
-    herror("gethostbyname");
-    return 1;
-  }
-  addr_list=(struct in_addr **) he->h_addr_list;
-
-  //Return the first one;                                                                
-  for (i=0;addr_list[i]!=NULL;i++) {
-    strcpy(ip,inet_ntoa(*addr_list[i]));
-    return 0;
-  }
-
-  return 1;
-}
-
-// Read a line of maximum length int lim from file FILE into string s
-int fgetline(FILE *file,char *s,int lim)
-{
-  int c,i=0;
-
-  while (--lim > 0 && (c=fgetc(file)) != EOF && c != '\n')
-    s[i++] = c;
-  if (c == '\t')
-    c=' ';
-  //  if (c == '\n')
-  //    s[i++] = c;
-  s[i] = '\0';
-  return i;
 }
