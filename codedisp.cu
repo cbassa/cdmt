@@ -206,10 +206,10 @@ int main(int argc, char *argv[])
   float v0=100.0; // spin frequency (Hz)
   float w=1000.0; // von Mises width (k~1/w)
   float a0=2.0,a1=64.0; // amplitude
-  float dm=100.0; // DM (pc/cc)
-  double f0=135e6; // Frequency (Hz)
-  double df=195312.5; // Bandwidth (Hz)
-  float length=600.0; // length in (s)
+  float dm=1.0; // DM (pc/cc)
+  double f0=1420e6; // Frequency (Hz)
+  double df=320.0e6; // Bandwidth (Hz)
+  float length=1.0; // length in (s)
   double tsamp;
   curandGenerator_t genp1,genp2;
   cufftComplex *cp1,*cp2,*cp1p,*cp2p,*dc;

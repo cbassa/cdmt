@@ -42,6 +42,7 @@ __global__ void compute_chirp(double fcen,double bw,float *dm,int nchan,int nbin
 __global__ void compute_block_sums(float *z,int nchan,int nblock,int nsum,float *bs1,float *bs2);
 __global__ void compute_channel_statistics(int nchan,int nblock,int nsum,float *bs1,float *bs2,float *zavg,float *zstd);
 __global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
+__global__ void decimate_and_redigitize(float *z,int ndec,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
 void write_filterbank_header(struct header h,FILE *file);
 int hostname_to_ip(char * hostname , char* ip);
 int fgetline(FILE *file,char *s,int lim);
@@ -56,8 +57,8 @@ void usage()
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=8192,nsub=20,ndm;
-  int idm,iblock,nread,mchan,msamp,mblock,msum=1024,nwrite;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=8192,nsub=20,ndm,ndec=1;
+  int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
   char *header,*h5buf[4],*dh5buf[4];
   FILE *rawfile[4],*file;
   unsigned char *cbuf,*dcbuf;
@@ -75,17 +76,21 @@ int main(int argc,char *argv[])
   struct sockaddr_in addr;
   char **ip_address;
   int port=56000,part=0,device=0;
-  int *iskt,nskt,nip;
+  int *iskt,nskt,nip,so_reuse=1;
   uint32_t tcp_blocksize,nfiles,filenamesize,headersize,buffersize,serialized_int;
   int arg=0;
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"n:p:P:d:D:ho:"))!=-1) {
+    while ((arg=getopt(argc,argv,"n:p:P:d:D:ho:b:"))!=-1) {
       switch (arg) {
 	
       case 'n':
 	strcpy(nodelist,optarg);
+	break;
+
+      case 'b':
+	ndec=atoi(optarg);
 	break;
 
       case 'o':
@@ -151,7 +156,7 @@ int main(int argc,char *argv[])
   nsub=h5.nsub;
 
   // Adjust header for filterbank format
-  h5.tsamp*=nchan;
+  h5.tsamp*=nchan*ndec;
   h5.nchan=nsub*nchan;
   h5.nbit=8;
   h5.fch1=h5.fcen+0.5*h5.nsub*h5.bwchan-0.5*h5.bwchan/nchan;
@@ -198,8 +203,8 @@ int main(int argc,char *argv[])
   // Allocate output buffers
   fbuf=(float *) malloc(sizeof(float)*nsamp*nsub);
   checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
-  cbuf=(unsigned char *) malloc(sizeof(unsigned char)*msamp*mchan);
-  checkCudaErrors(cudaMalloc((void **) &dcbuf,sizeof(unsigned char)*msamp*mchan));
+  cbuf=(unsigned char *) malloc(sizeof(unsigned char)*msamp*mchan/ndec);
+  checkCudaErrors(cudaMalloc((void **) &dcbuf,sizeof(unsigned char)*msamp*mchan/ndec));
 
   // Allocate DMs and copy to device
   dm=(float *) malloc(sizeof(float)*ndm);
@@ -235,7 +240,7 @@ int main(int argc,char *argv[])
   filenamesize=128;
   headersize=bytes_read;
   tcp_blocksize=8192;
-  buffersize=msamp*mchan;
+  buffersize=msamp*mchan/ndec;
   printf("%d sockets, %d dms, %d files\n",nskt,ndm,nfiles);
 
   // Generate socket list (adjacent cDMs to same node
@@ -252,6 +257,10 @@ int main(int argc,char *argv[])
       fprintf(stderr,"ERROR opening socket\n");
       return -1;
     } 
+    if (setsockopt(skt[i],SOL_SOCKET,SO_REUSEADDR,&so_reuse,sizeof(int))<0) {
+      fprintf(stderr,"ERROR reusing socket\n");
+      return -1;
+    }
 
     addr.sin_family=AF_INET;
     addr.sin_port=htons(port);
@@ -297,6 +306,7 @@ int main(int argc,char *argv[])
   }
 
   // Loop over input file contents
+  //  for (iblock=0;iblock<40;iblock++) {
   for (iblock=0;;iblock++) {
     // Read block
     startclock=clock();
@@ -361,18 +371,19 @@ int main(int argc,char *argv[])
       // Redigitize data to 8bits
       blocksize.x=32; blocksize.y=32; blocksize.z=1;
       gridsize.x=mchan/blocksize.x+1; gridsize.y=mblock/blocksize.y+1; gridsize.z=1;
-      redigitize<<<gridsize,blocksize>>>(dfbuf,mchan,mblock,msum,zavg,zstd,3.0,5.0,dcbuf);
-      
+      if (ndec==1)
+	redigitize<<<gridsize,blocksize>>>(dfbuf,mchan,mblock,msum,zavg,zstd,3.0,5.0,dcbuf);
+      else
+	decimate_and_redigitize<<<gridsize,blocksize>>>(dfbuf,ndec,mchan,mblock,msum,zavg,zstd,3.0,5.0,dcbuf);      
+
       // Copy buffer to host
-      checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan,cudaMemcpyDeviceToHost));
+      checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan/ndec,cudaMemcpyDeviceToHost));
+
       // Write buffer
-      serialized_int=htonl(nread*nsub);
+      serialized_int=htonl(nread*nsub/ndec);
       write(skt[idm],&serialized_int,sizeof(uint32_t));
-      for (i=0;i<nread*nsub;i+=tcp_blocksize) {
-	nwrite=write(skt[idm],&cbuf[i],tcp_blocksize);
-	if (nwrite!=tcp_blocksize)
-	  printf("bla iblock; %d i; %d bytes written: %d\n",iblock,i,nwrite);
-      }
+      for (i=0;i<nread*nsub/ndec;i+=tcp_blocksize)
+	write(skt[idm],&cbuf[i],tcp_blocksize);
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
@@ -921,6 +932,36 @@ __global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,fl
       cz[idx1]=(unsigned char) z[idx1];
       if (z[idx1]<0.0) cz[idx1]=0;
       if (z[idx1]>255.0) cz[idx1]=255;
+    }
+  }
+
+  return;
+}
+
+// Decimate and Redigitize the filterbank to 8 bits in segments
+__global__ void decimate_and_redigitize(float *z,int ndec,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz)
+{
+  int64_t ichan,iblock,isum,idx1,idx2,idec;
+  float zoffset,zscale,ztmp;
+
+  ichan=blockIdx.x*blockDim.x+threadIdx.x;
+  iblock=blockIdx.y*blockDim.y+threadIdx.y;
+  if (ichan<nchan && iblock<nblock) {
+    zoffset=zavg[ichan]-zmin*zstd[ichan];
+    zscale=(zmin+zmax)*zstd[ichan];
+
+    for (isum=0;isum<nsum;isum+=ndec) {
+      idx2=ichan+nchan*(isum/ndec+iblock*nsum/ndec);
+      for (idec=0,ztmp=0.0;idec<ndec;idec++) {
+	idx1=ichan+nchan*(isum+idec+iblock*nsum);
+	ztmp+=z[idx1];
+      }
+      ztmp/=(float) ndec;
+      ztmp-=zoffset;
+      ztmp*=256.0/zscale;
+      cz[idx2]=(unsigned char) ztmp;
+      if (ztmp<0.0) cz[idx2]=0;
+      if (ztmp>255.0) cz[idx2]=255;
     }
   }
 
