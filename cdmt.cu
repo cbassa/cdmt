@@ -239,8 +239,10 @@ int main(int argc,char *argv[])
     startclock=clock();
     for (i=0;i<4;i++)
       nread=fread(h5buf[i],sizeof(char),nsamp*nsub,rawfile[i])/nsub;
-    if (nread==0)
+    if (nread==0) {
+      printf("No data read from last file; assuming EOF, finishng up.\n");
       break;
+    }
     printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     // Copy buffers to device
