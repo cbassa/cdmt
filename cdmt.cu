@@ -151,6 +151,18 @@ int main(int argc,char *argv[])
   // Set device
   checkCudaErrors(cudaSetDevice(device));
 
+  // DMcK: cuFFT docs say it's best practice to plan before allocating memory
+  // cuda-memcheck fails initialisation before this block is run?
+  // Generate FFT plan (batch in-place forward FFT)
+  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
+  cudaDeviceSynchronize();
+
+  // Generate FFT plan (batch in-place backward FFT)
+  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
+  cudaDeviceSynchronize();
+
   // Allocate memory for complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1, (size_t) sizeof(cufftComplex)*nbin*nfft*nsub));
   checkCudaErrors(cudaMalloc((void **) &cp2, (size_t) sizeof(cufftComplex)*nbin*nfft*nsub));
@@ -187,14 +199,6 @@ int main(int argc,char *argv[])
     dm[idm]=dm_start+(float) idm*dm_step;
   checkCudaErrors(cudaMalloc((void **) &ddm, (size_t) sizeof(float)*ndm));
   checkCudaErrors(cudaMemcpy(ddm,dm,sizeof(float)*ndm,cudaMemcpyHostToDevice));
-
-  // Generate FFT plan (batch in-place forward FFT)
-  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
-
-  // Generate FFT plan (batch in-place backward FFT)
-  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
 
   // Compute chirp
   blocksize.x=32; blocksize.y=32; blocksize.z=1;
