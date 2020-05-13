@@ -118,6 +118,7 @@ int main(int argc,char *argv[])
       }
     }
   } else {
+    printf("Unknown option '%c'\n", arg);
     usage();
     return 0;
   }
