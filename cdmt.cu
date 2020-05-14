@@ -118,6 +118,7 @@ int main(int argc,char *argv[])
       }
     }
   } else {
+    printf("Unknown option '%c'\n", arg);
     usage();
     return 0;
   }
@@ -151,50 +152,54 @@ int main(int argc,char *argv[])
   // Set device
   checkCudaErrors(cudaSetDevice(device));
 
+  // DMcK: cuFFT docs say it's best practice to plan before allocating memory
+  // cuda-memcheck fails initialisation before this block is run?
+  // Generate FFT plan (batch in-place forward FFT)
+  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
+  cudaDeviceSynchronize();
+
+  // Generate FFT plan (batch in-place backward FFT)
+  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
+  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
+  cudaDeviceSynchronize();
+
   // Allocate memory for complex timeseries
-  checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
-  checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nfft*nsub));
-  checkCudaErrors(cudaMalloc((void **) &cp1p,sizeof(cufftComplex)*nbin*nfft*nsub));
-  checkCudaErrors(cudaMalloc((void **) &cp2p,sizeof(cufftComplex)*nbin*nfft*nsub));
+  checkCudaErrors(cudaMalloc((void **) &cp1, (size_t) sizeof(cufftComplex)*nbin*nfft*nsub));
+  checkCudaErrors(cudaMalloc((void **) &cp2, (size_t) sizeof(cufftComplex)*nbin*nfft*nsub));
+  checkCudaErrors(cudaMalloc((void **) &cp1p,(size_t) sizeof(cufftComplex)*nbin*nfft*nsub));
+  checkCudaErrors(cudaMalloc((void **) &cp2p,(size_t) sizeof(cufftComplex)*nbin*nfft*nsub));
 
   // Allocate device memory for chirp
-  checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin*nsub*ndm));
+  checkCudaErrors(cudaMalloc((void **) &dc, (size_t) sizeof(cufftComplex)*nbin*nsub*ndm));
 
   // Allocate device memory for block sums
-  checkCudaErrors(cudaMalloc((void **) &bs1,sizeof(float)*mblock*mchan));
-  checkCudaErrors(cudaMalloc((void **) &bs2,sizeof(float)*mblock*mchan));
+  checkCudaErrors(cudaMalloc((void **) &bs1, (size_t) sizeof(float)*mblock*mchan));
+  checkCudaErrors(cudaMalloc((void **) &bs2, (size_t) sizeof(float)*mblock*mchan));
 
   // Allocate device memory for channel averages and standard deviations
-  checkCudaErrors(cudaMalloc((void **) &zavg,sizeof(float)*mchan));
-  checkCudaErrors(cudaMalloc((void **) &zstd,sizeof(float)*mchan));
+  checkCudaErrors(cudaMalloc((void **) &zavg, (size_t) sizeof(float)*mchan));
+  checkCudaErrors(cudaMalloc((void **) &zstd, (size_t) sizeof(float)*mchan));
 
   // Allocate memory for redigitized output and header
   header=(char *) malloc(sizeof(char)*HEADERSIZE);
   for (i=0;i<4;i++) {
     h5buf[i]=(char *) malloc(sizeof(char)*nsamp*nsub);
-    checkCudaErrors(cudaMalloc((void **) &dh5buf[i],sizeof(char)*nsamp*nsub));
+    checkCudaErrors(cudaMalloc((void **) &dh5buf[i], (size_t) sizeof(char)*nsamp*nsub));
   }
 
   // Allocate output buffers
   fbuf=(float *) malloc(sizeof(float)*nsamp*nsub);
-  checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
+  checkCudaErrors(cudaMalloc((void **) &dfbuf, (size_t) sizeof(float)*nsamp*nsub));
   cbuf=(unsigned char *) malloc(sizeof(unsigned char)*msamp*mchan/ndec);
-  checkCudaErrors(cudaMalloc((void **) &dcbuf,sizeof(unsigned char)*msamp*mchan/ndec));
+  checkCudaErrors(cudaMalloc((void **) &dcbuf, (size_t) sizeof(unsigned char)*msamp*mchan/ndec));
 
   // Allocate DMs and copy to device
   dm=(float *) malloc(sizeof(float)*ndm);
   for (idm=0;idm<ndm;idm++)
     dm[idm]=dm_start+(float) idm*dm_step;
-  checkCudaErrors(cudaMalloc((void **) &ddm,sizeof(float)*ndm));
+  checkCudaErrors(cudaMalloc((void **) &ddm, (size_t) sizeof(float)*ndm));
   checkCudaErrors(cudaMemcpy(ddm,dm,sizeof(float)*ndm,cudaMemcpyHostToDevice));
-
-  // Generate FFT plan (batch in-place forward FFT)
-  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
-
-  // Generate FFT plan (batch in-place backward FFT)
-  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
 
   // Compute chirp
   blocksize.x=32; blocksize.y=32; blocksize.z=1;
@@ -234,8 +239,10 @@ int main(int argc,char *argv[])
     startclock=clock();
     for (i=0;i<4;i++)
       nread=fread(h5buf[i],sizeof(char),nsamp*nsub,rawfile[i])/nsub;
-    if (nread==0)
+    if (nread==0) {
+      printf("No data read from last file; assuming EOF, finishng up.\n");
       break;
+    }
     printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     // Copy buffers to device
