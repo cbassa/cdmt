@@ -33,6 +33,8 @@ static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float
 static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftComplex b);
 static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,int l,float scale);
 __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
+__global__ void unpack_and_padd_first_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
+__global__ void padd_next_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
 __global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
 __global__ void compute_chirp(double fcen,double bw,float *dm,int nchan,int nbin,int nsub,int ndm,cufftComplex *c);
 __global__ void compute_block_sums(float *z,int nchan,int nblock,int nsum,float *bs1,float *bs2);
@@ -228,14 +230,18 @@ int main(int argc,char *argv[])
     rawfile[i]=fopen(h5.rawfname[i],"r");
   }
 
+  int writeOffset, writeSamples;
   // Loop over input file contents
   for (iblock=0;;iblock++) {
+    writeOffset = (iblock == 0) ? 2 * noverlap : 0;
     // Read block
     startclock=clock();
     for (i=0;i<4;i++)
       nread=fread(h5buf[i],sizeof(char),nsamp*nsub,rawfile[i])/nsub;
     if (nread==0)
       break;
+
+    writeSamples = nread - writeOffset;
     printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     // Copy buffers to device
@@ -246,7 +252,11 @@ int main(int argc,char *argv[])
     // Unpack data and padd data
     blocksize.x=32; blocksize.y=32; blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
-    unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+    if (iblock > 0) {
+      unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+    } else {
+      unpack_and_padd_first_iteration<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+    }
 
     // Perform FFTs
     checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1p,(cufftComplex *) cp1p,CUFFT_FORWARD));
@@ -266,6 +276,12 @@ int main(int argc,char *argv[])
       PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1p,dc,cp1,nbin*nsub,nfft,idm,1.0/(float) nbin);
       PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2p,dc,cp2,nbin*nsub,nfft,idm,1.0/(float) nbin);
       
+      if (idm == ndm - 1) {
+        blocksize.x=32; blocksize.y=32; blocksize.z=1;
+        gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
+        padd_next_iteration<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+      }
+
       // Swap spectrum halves for small FFTs
       blocksize.x=32; blocksize.y=32; blocksize.z=1;
       gridsize.x=mbin/blocksize.x+1; gridsize.y=nchan*nfft*nsub/blocksize.y+1; gridsize.z=1;
@@ -302,7 +318,7 @@ int main(int argc,char *argv[])
       checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan/ndec,cudaMemcpyDeviceToHost));
 
       // Write buffer
-      fwrite(cbuf,sizeof(char),nread*nsub/ndec,outfile[idm]);
+      fwrite(&(cbuf[writeOffset]),sizeof(char),writeSamples*nsub/ndec,outfile[idm]);
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
@@ -609,15 +625,10 @@ __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,
 
   // Only compute valid threads
   if (ibin<nbin && ifft<nfft && isub<nsub) {
-    idx1=ibin+nbin*isub+nsub*nbin*ifft;
     isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
-    idx2=isub+nsub*isamp;
-    if (isamp<0 || isamp>=nsamp) {
-      cp1[idx1].x=0.0;
-      cp1[idx1].y=0.0;
-      cp2[idx1].x=0.0;
-      cp2[idx1].y=0.0;
-    } else {
+    if (isamp >= noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(isamp-noverlap);
       cp1[idx1].x=(float) dbuf0[idx2];
       cp1[idx1].y=(float) dbuf1[idx2];
       cp2[idx1].x=(float) dbuf2[idx2];
@@ -627,6 +638,82 @@ __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,
 
   return;
 }
+
+
+
+// Unpack the input buffer and generate complex timeseries. The output
+// timeseries are padded with noverlap samples on either side for the
+// convolution. This is separate from the main kernel to minimise performance
+// loss to branching on the GPU. On the first iteration, we want to fill
+// the final non-noverlap region and final noverlap region so that they can 
+// match the first noverlap region and first non-noverlap on the second
+// iteration
+__global__ void unpack_and_padd_first_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+{
+  int64_t ibin,ifft,isamp,isub,idx1,idx2;
+
+  // Indices of input data
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+  isub=blockIdx.z*blockDim.z+threadIdx.z;
+
+  // Only compute valid threads
+  if (ibin<nbin && ifft<nfft && isub<nsub) {
+    isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
+    if (isamp >= 2*noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(isamp-2*noverlap);
+
+      cp1[idx1].x=(float) dbuf0[idx2];
+      cp1[idx1].y=(float) dbuf1[idx2];
+      cp2[idx1].x=(float) dbuf2[idx2];
+      cp2[idx1].y=(float) dbuf3[idx2];
+    } else if (isamp >= noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(2*noverlap-isamp);
+
+      cp1[idx1].x=(float) dbuf0[idx2];
+      cp1[idx1].y=(float) dbuf1[idx2];
+      cp2[idx1].x=(float) dbuf2[idx2];
+      cp2[idx1].y=(float) dbuf3[idx2];
+    }
+  }
+
+  return;
+}
+
+// Unpack the input buffer and generate complex timeseries. The output
+// timeseries are located in the first noverlap region and first non-
+// noverlap region, for continuous time series between data blocks
+// 
+// overlap_(timeblock)_(index)
+// t = 0: overlap_0_0: nfft_0_0, nfft_0_1... nfft_0_N-1, nfft_0 N: overlap_0_1
+// t = 1: nfft_0_N: overlap_0_1, nfft_1_0.... nfft_1_N-1:overlap_1_1
+// t = 2 nfft_1_N-1: overlap_1_1...
+// etc
+__global__ void padd_next_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+{
+  int64_t ibin,ifft,isamp,isub,idx1,idx2;
+
+  // Indices of input data
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+  isub=blockIdx.z*blockDim.z+threadIdx.z;
+
+  // Only compute valid threads
+  if (ibin<nbin && ifft<nfft && isub<nsub) {
+    isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
+    if (isamp<noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(isamp+nsamp-noverlap);
+      cp1[idx1].x=(float) dbuf0[idx2];
+      cp1[idx1].y=(float) dbuf1[idx2];
+      cp2[idx1].x=(float) dbuf2[idx2];
+      cp2[idx1].y=(float) dbuf3[idx2];
+    }
+  }
+}
+
 
 // Since complex-to-complex FFTs put the center frequency at bin zero
 // in the frequency domain, the two halves of the spectrum need to be
