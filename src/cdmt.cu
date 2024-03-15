@@ -1,19 +1,51 @@
+// Standard libraries
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <math.h>
 #include <time.h>
-#include<errno.h>
-#include <cuda.h>
-#include <cufft.h>
-#include <helper_functions.h>
-#include <helper_cuda.h>
+#include <errno.h>
 #include <getopt.h>
+
+// Non-standard libraries
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cufft.h>
 #include <hdf5.h>
 
 #define HEADERSIZE 4096
 #define DMCONSTANT 2.41e-10
+
+inline void __checkCudaErrors(cudaError_t code, const char *file, int line)
+{
+    /* Wrapper function for GPU/CUDA error handling. Every CUDA call goes through
+       this function. It will return a message giving you the error string,
+       file name and line of the error. Aborts on error. */
+
+    if (code != 0)
+    {
+        fprintf(stderr, "CUDA Error:: %s - %s (%d)\n", cudaGetErrorString(code), file, line);
+        exit(code);
+    }
+}
+
+inline void __checkCufftErrors(cufftResult code, const char *file, int line)
+{
+    /* Wrapper function for CUFFT error handling. Every CUDA call goes through
+       this function. It will return a message giving you the error string,
+       file name and line of the error. Aborts on error. */
+
+    if (code != CUFFT_SUCCESS)
+    {
+        fprintf(stderr, "CUFFT Error:: Failed with error code %d\n", code);
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Define macros for accessing error checking functions
+#define checkCudaErrors(ans) {__checkCudaErrors((ans), __FILE__, __LINE__);}
+#define checkCufftErrors(ans) {__checkCufftErrors((ans), __FILE__, __LINE__);}
 
 // Struct for header information
 struct header {
@@ -190,11 +222,11 @@ int main(int argc,char *argv[])
 
   // Generate FFT plan (batch in-place forward FFT)
   idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
+  checkCufftErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
 
   // Generate FFT plan (batch in-place backward FFT)
   idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
-  checkCudaErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
+  checkCufftErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
 
   // Compute chirp
   blocksize.x=32; blocksize.y=32; blocksize.z=1;
@@ -249,8 +281,8 @@ int main(int argc,char *argv[])
     unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
 
     // Perform FFTs
-    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1p,(cufftComplex *) cp1p,CUFFT_FORWARD));
-    checkCudaErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2p,(cufftComplex *) cp2p,CUFFT_FORWARD));
+    checkCufftErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1p,(cufftComplex *) cp1p,CUFFT_FORWARD));
+    checkCufftErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp2p,(cufftComplex *) cp2p,CUFFT_FORWARD));
 
     // Swap spectrum halves for large FFTs
     blocksize.x=32; blocksize.y=32; blocksize.z=1;
@@ -272,8 +304,8 @@ int main(int argc,char *argv[])
       swap_spectrum_halves<<<gridsize,blocksize>>>(cp1,cp2,mbin,nchan*nfft*nsub);
       
       // Perform FFTs
-      checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
-      checkCudaErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
+      checkCufftErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp1,(cufftComplex *) cp1,CUFFT_INVERSE));
+      checkCufftErrors(cufftExecC2C(ftc2cb,(cufftComplex *) cp2,(cufftComplex *) cp2,CUFFT_INVERSE));
       
       // Detect data
       blocksize.x=32; blocksize.y=32; blocksize.z=1;
