@@ -1,93 +1,4 @@
-// Standard libraries
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <math.h>
-#include <time.h>
-#include <errno.h>
-#include <getopt.h>
-
-// Non-standard libraries
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cufft.h>
-#include <hdf5.h>
-
-#define HEADERSIZE 4096
-#define DMCONSTANT 2.41e-10
-
-inline void __checkCudaErrors(cudaError_t code, const char *file, int line)
-{
-    /* Wrapper function for GPU/CUDA error handling. Every CUDA call goes through
-       this function. It will return a message giving you the error string,
-       file name and line of the error. Aborts on error. */
-
-    if (code != 0)
-    {
-        fprintf(stderr, "CUDA Error:: %s - %s (%d)\n", cudaGetErrorString(code), file, line);
-        exit(code);
-    }
-}
-
-inline void __checkCufftErrors(cufftResult code, const char *file, int line)
-{
-    /* Wrapper function for CUFFT error handling. Every CUDA call goes through
-       this function. It will return a message giving you the error string,
-       file name and line of the error. Aborts on error. */
-
-    if (code != CUFFT_SUCCESS)
-    {
-        fprintf(stderr, "CUFFT Error:: Failed with error code %d\n", code);
-        exit(EXIT_FAILURE);
-    }
-}
-
-// Define macros for accessing error checking functions
-#define checkCudaErrors(ans) {__checkCudaErrors((ans), __FILE__, __LINE__);}
-#define checkCufftErrors(ans) {__checkCufftErrors((ans), __FILE__, __LINE__);}
-
-// Struct for header information
-struct header {
-  int64_t headersize,buffersize;
-  unsigned int nchan,nsamp,nbit,nif,nsub;
-  int machine_id,telescope_id,nbeam,ibeam,sumif;
-  double tstart,tsamp,fch1,foff,fcen,bwchan;
-  double src_raj,src_dej,az_start,za_start;
-  char source_name[80],ifstream[8],inpfile[80];
-  char *rawfname[4];
-};
-
-struct header read_h5_header(char *fname);
-void get_channel_chirp(double fcen,double bw,float dm,int nchan,int nbin,int nsub,cufftComplex *c);
-__global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,int nbin,int nchan,int nfft,int nsub,int noverlap,int nsamp,float *fbuf);
-static __device__ __host__ inline cufftComplex ComplexScale(cufftComplex a,float s);
-static __device__ __host__ inline cufftComplex ComplexMul(cufftComplex a,cufftComplex b);
-static __global__ void PointwiseComplexMultiply(cufftComplex *a,cufftComplex *b,cufftComplex *c,int nx,int ny,int l,float scale);
-__global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2);
-__global__ void swap_spectrum_halves(cufftComplex *cp1,cufftComplex *cp2,int nx,int ny);
-__global__ void compute_chirp(double fcen,double bw,float *dm,int nchan,int nbin,int nsub,int ndm,cufftComplex *c);
-__global__ void compute_block_sums(float *z,int nchan,int nblock,int nsum,float *bs1,float *bs2);
-__global__ void compute_channel_statistics(int nchan,int nblock,int nsum,float *bs1,float *bs2,float *zavg,float *zstd);
-__global__ void redigitize(float *z,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
-__global__ void decimate_and_redigitize(float *z,int ndec,int nchan,int nblock,int nsum,float *zavg,float *zstd,float zmin,float zmax,unsigned char *cz);
-void write_filterbank_header(struct header h,FILE *file);
-
-// Usage
-void usage()
-{
-  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -b <ndec> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
-  printf("Compute coherently dedispersed SIGPROC filterbank files from LOFAR complex voltage data in HDF5 format.\n");
-  printf("-P <part>        Specify part number for input file [integer, default: 0]\n");
-  printf("-D <GPU device>  Select GPU device [integer, default: 0]\n");
-  printf("-b <ndec>        Number of time samples to average [integer, default: 1]\n");
-  printf("-d <DM start, step, num>  DM start and stepsize, number of DM trials\n");
-  printf("-o <outputname>           Output filename [default: cdmt]\n");
-  printf("-N <forward FFT size>     Forward FFT size [integer, default: 65536]\n");
-  printf("-n <overlap region>       Overlap region [integer, default: 2048]\n");
-
-  return;
-}
+#include "cdmt.h"
 
 int main(int argc,char *argv[])
 {
@@ -105,7 +16,7 @@ int main(int argc,char *argv[])
   struct header h5;
   clock_t startclock;
   float *dm,*ddm,dm_start,dm_step;
-  char fname[128],fheader[1024],*h5fname,obsid[128]="cdmt";
+  char fname[462],fheader[1024],*h5fname,obsid[128]="cdmt";
   int bytes_read;
   int part=0,device=0;
   int arg=0;
@@ -268,7 +179,7 @@ int main(int argc,char *argv[])
       nread=fread(h5buf[i],sizeof(char),nsamp*nsub,rawfile[i])/nsub;
     if (nread==0)
       break;
-    printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
+    printf("Block: %d: Read %lu MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     // Copy buffers to device
     startclock=clock();
@@ -379,169 +290,20 @@ int main(int argc,char *argv[])
   return 0;
 }
 
-// This is a simple H5 reader for complex voltage data. Very little
-// error checking is done.
-struct header read_h5_header(char *fname)
+// Usage
+void usage()
 {
-  int i,len,ibeam,isap;
-  struct header h;
-  hid_t file_id,attr_id,sap_id,beam_id,memtype,group_id,space,coord_id;
-  char *string,*pch;
-  const char *stokes[]={"_S0_","_S1_","_S2_","_S3_"};
-  char *froot,*fpart,*ftest,group[32];
-  FILE *file;
+  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -b <ndec> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
+  printf("Compute coherently dedispersed SIGPROC filterbank files from LOFAR complex voltage data in HDF5 format.\n");
+  printf("-P <part>        Specify part number for input file [integer, default: 0]\n");
+  printf("-D <GPU device>  Select GPU device [integer, default: 0]\n");
+  printf("-b <ndec>        Number of time samples to average [integer, default: 1]\n");
+  printf("-d <DM start, step, num>  DM start and stepsize, number of DM trials\n");
+  printf("-o <outputname>           Output filename [default: cdmt]\n");
+  printf("-N <forward FFT size>     Forward FFT size [integer, default: 65536]\n");
+  printf("-n <overlap region>       Overlap region [integer, default: 2048]\n");
 
-  // Find filenames
-  for (i=0;i<4;i++) {
-    pch=strstr(fname,stokes[i]);
-    if (pch!=NULL)
-      break;
-  }
-  len=strlen(fname)-strlen(pch);
-  froot=(char *) malloc(sizeof(char)*(len+1));
-  fpart=(char *) malloc(sizeof(char)*(strlen(pch)-6));
-  ftest=(char *) malloc(sizeof(char)*(len+20));
-  strncpy(froot,fname,len);
-  strncpy(fpart,pch+4,strlen(pch)-7);
-
-  // Check files
-  for (i=0;i<4;i++) {
-    // Format file name
-    sprintf(ftest,"%s_S%d_%s.raw",froot,i,fpart);
-    // Try to open
-    if ((file=fopen(ftest,"r"))!=NULL) {
-      fclose(file);
-    } else {
-      fprintf(stderr,"Raw file %s not found\n",ftest);
-      exit (-1);
-    }
-    h.rawfname[i]=(char *) malloc(sizeof(char)*(strlen(ftest)+1));
-    strcpy(h.rawfname[i],ftest);
-  }
-
-  // Get beam number
-  for (i=0;i<4;i++) {
-    pch=strstr(fname,"_B");
-    if (pch!=NULL)
-      break;
-  }
-  sscanf(pch+2,"%d",&ibeam);
-
-  // Get SAP number
-  for (i=0;i<4;i++) {
-    pch=strstr(fname,"_SAP");
-    if (pch!=NULL)
-      break;
-  }
-  sscanf(pch+4,"%d",&isap);
-
-  // Free
-  free(froot);
-  free(fpart);
-  free(ftest);
-
-  // Open file
-  file_id=H5Fopen(fname,H5F_ACC_RDONLY,H5P_DEFAULT);
-
-  // Open subarray pointing group
-  sprintf(group,"SUB_ARRAY_POINTING_%03d",isap);
-  sap_id=H5Gopen(file_id,group,H5P_DEFAULT);
-
-  // Start MJD
-  attr_id=H5Aopen(sap_id,"EXPTIME_START_MJD",H5P_DEFAULT);
-  H5Aread(attr_id,H5T_IEEE_F64LE,&h.tstart);
-  H5Aclose(attr_id);
-
-  // Declination
-  attr_id=H5Aopen(sap_id,"POINT_DEC",H5P_DEFAULT);
-  H5Aread(attr_id,H5T_IEEE_F64LE,&h.src_dej);
-  H5Aclose(attr_id);
-
-  // Right ascension
-  attr_id=H5Aopen(sap_id,"POINT_RA",H5P_DEFAULT);
-  H5Aread(attr_id,H5T_IEEE_F64LE,&h.src_raj);
-  H5Aclose(attr_id);
-
-  // Open beam
-  sprintf(group,"BEAM_%03d",ibeam);
-  beam_id=H5Gopen(sap_id,group,H5P_DEFAULT);
-
-  // Number of samples
-  attr_id=H5Aopen(beam_id,"NOF_SAMPLES",H5P_DEFAULT);
-  H5Aread(attr_id,H5T_STD_U32LE,&h.nsamp);
-  H5Aclose(attr_id);
-
-  // Center frequency
-  attr_id=H5Aopen(beam_id,"BEAM_FREQUENCY_CENTER",H5P_DEFAULT);
-  H5Aread(attr_id,H5T_IEEE_F64LE,&h.fcen);
-  H5Aclose(attr_id);
-
-  // Center frequency unit
-  attr_id=H5Aopen(beam_id,"BEAM_FREQUENCY_CENTER_UNIT",H5P_DEFAULT);
-  memtype=H5Tcopy(H5T_C_S1);
-  H5Tset_size(memtype,H5T_VARIABLE);
-  H5Aread(attr_id,memtype,&string);
-  H5Aclose(attr_id);
-  if (strcmp(string,"Hz")==0)
-    h.fcen/=1e6;
-
-  // Channel bandwidth
-  attr_id=H5Aopen(beam_id,"CHANNEL_WIDTH",H5P_DEFAULT);
-  H5Aread(attr_id,H5T_IEEE_F64LE,&h.bwchan);
-  H5Aclose(attr_id);
-
-  // Center frequency unit
-  attr_id=H5Aopen(beam_id,"CHANNEL_WIDTH_UNIT",H5P_DEFAULT);
-  memtype=H5Tcopy(H5T_C_S1);
-  H5Tset_size(memtype,H5T_VARIABLE);
-  H5Aread(attr_id,memtype,&string);
-  H5Aclose(attr_id);
-  if (strcmp(string,"Hz")==0)
-    h.bwchan/=1e6;
-
-  // Get source
-  attr_id=H5Aopen(beam_id,"TARGETS",H5P_DEFAULT);
-  memtype=H5Tcopy(H5T_C_S1);
-  H5Tset_size(memtype,H5T_VARIABLE);
-  H5Aread(attr_id,memtype,&string);
-  H5Aclose(attr_id);
-  strcpy(h.source_name,string);
-
-  // Open coordinates
-  coord_id=H5Gopen(beam_id,"COORDINATES",H5P_DEFAULT);
-
-  // Open coordinate 0
-  group_id=H5Gopen(coord_id,"COORDINATE_0",H5P_DEFAULT);
-
-  // Sampling time
-  attr_id=H5Aopen(group_id,"INCREMENT",H5P_DEFAULT);
-  H5Aread(attr_id,H5T_IEEE_F64LE,&h.tsamp);
-  H5Aclose(attr_id);
-
-  // Close group
-  H5Gclose(group_id);
-
-  // Open coordinate 1
-  group_id=H5Gopen(coord_id,"COORDINATE_1",H5P_DEFAULT);
-
-  // Number of subbands
-  attr_id=H5Aopen(group_id,"AXIS_VALUES_WORLD",H5P_DEFAULT);
-  space=H5Aget_space(attr_id);
-  h.nsub=H5Sget_simple_extent_npoints(space);
-  H5Aclose(attr_id);
-
-  // Close group
-  H5Gclose(group_id);
-
-  // Close coordinates
-  H5Gclose(coord_id);
-
-  // Close beam, sap and file
-  H5Gclose(beam_id);
-  H5Gclose(sap_id);
-  H5Fclose(file_id);
-
-  return h;
+  return;
 }
 
 // Scale cufftComplex 
@@ -723,94 +485,6 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
 	fbuf[idx2]=cp1[idx1].x*cp1[idx1].x+cp1[idx1].y*cp1[idx1].y+cp2[idx1].x*cp2[idx1].x+cp2[idx1].y*cp2[idx1].y;
     }
   }
-
-  return;
-}
-
-void send_string(const char *string,FILE *file)
-{
-  int len;
-
-  len=strlen(string);
-  fwrite(&len,sizeof(int),1,file);
-  fwrite(string,sizeof(char),len,file);
-
-  return;
-}
-
-void send_float(const char *string,float x,FILE *file)
-{
-  send_string(string,file);
-  fwrite(&x,sizeof(float),1,file);
-
-  return;
-}
-
-void send_int(const char *string,int x,FILE *file)
-{
-  send_string(string,file);
-  fwrite(&x,sizeof(int),1,file);
-
-  return;
-}
-
-void send_double(const char *string,double x,FILE *file)
-{
-  send_string(string,file);
-  fwrite(&x,sizeof(double),1,file);
-
-  return;
-}
-
-double dec2sex(double x)
-{
-  double d,sec,min,deg;
-  char sign;
-  char tmp[32];
-
-  sign=(x<0 ? '-' : ' ');
-  x=3600.0*fabs(x);
-
-  sec=fmod(x,60.0);
-  x=(x-sec)/60.0;
-  min=fmod(x,60.0);
-  x=(x-min)/60.0;
-  deg=x;
-
-  sprintf(tmp,"%c%02d%02d%09.6lf",sign,(int) deg,(int) min,sec);
-  sscanf(tmp,"%lf",&d);
-
-  return d;
-}
-
-void write_filterbank_header(struct header h,FILE *file)
-{
-  double ra,de;
-
-
-  ra=dec2sex(h.src_raj/15.0);
-  de=dec2sex(h.src_dej);
-  
-  send_string("HEADER_START",file);
-  send_string("rawdatafile",file);
-  send_string(h.rawfname[0],file);
-  send_string("source_name",file);
-  send_string(h.source_name,file);
-  send_int("machine_id",11,file);
-  send_int("telescope_id",11,file);
-  send_double("src_raj",ra,file);
-  send_double("src_dej",de,file);
-  send_int("data_type",1,file);
-  send_double("fch1",h.fch1,file);
-  send_double("foff",h.foff,file);
-  send_int("nchans",h.nchan,file);
-  send_int("nbeams",0,file);
-  send_int("ibeam",0,file);
-  send_int("nbits",h.nbit,file);
-  send_double("tstart",h.tstart,file);
-  send_double("tsamp",h.tsamp,file);
-  send_int("nifs",1,file);
-  send_string("HEADER_END",file);
 
   return;
 }
