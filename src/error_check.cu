@@ -8,7 +8,7 @@ void __checkCudaErrors(cudaError_t code, const char *file, int line)
 
     if (code != 0)
     {
-        fprintf(stderr, "CUDA Error:: %s - %s (%d)\n", cudaGetErrorString(code), file, line);
+        fprintf(stderr, "CUDA Error :: %s - %s (%d)\n", cudaGetErrorString(code), file, line);
         exit(code);
     }
 }
@@ -21,7 +21,7 @@ void __checkCufftErrors(cufftResult code, const char *file, int line)
 
     if (code != CUFFT_SUCCESS)
     {
-        fprintf(stderr, "CUFFT Error:: Failed with error code %d\n", code);
+        fprintf(stderr, "CUFFT Error :: Failed with error code %d\n", code);
         exit(EXIT_FAILURE);
     }
 }
