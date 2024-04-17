@@ -1,2 +1,4 @@
 cdmt
 data/
+.vscode/
+*.code-workspace
