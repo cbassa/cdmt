@@ -2,73 +2,113 @@
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm,ndec=1;
-  int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
-  char *header,*h5buf[4],*dh5buf[4];
-  FILE *rawfile[4],*file;
-  unsigned char *cbuf,*dcbuf;
-  float *fbuf,*dfbuf;
-  float *bs1,*bs2,*zavg,*zstd;
-  cufftComplex *cp1,*cp2,*dc,*cp1p,*cp2p;
-  cufftHandle ftc2cf,ftc2cb;
-  int idist,odist,iembed,oembed,istride,ostride;
-  dim3 blocksize,gridsize;
-  struct header h5;
-  clock_t startclock;
-  float *dm,*ddm,dm_start,dm_step;
-  char fname[462],fheader[1024],*h5fname,obsid[128]="cdmt";
-  int bytes_read;
-  int part=0,device=0;
-  int arg=0;
-  FILE **outfile;
+  int arg=0;            // Command line inputs
+  int i,idm,iblock;     // Iterators
+  clock_t startclock;   // Clock time
+
+  // File input
+  char *h5fname;        // Name of first HDF5 metadata file
+  FILE *file;           // Pointer to first HDF5 metadata file
+  FILE *rawfile[4];     // Pointers to all HDF5 raw file parts
+  struct header h5;     // Struct containing HDF5 header info
+  char fheader[1024];   // Filterbank header string
+  int nread;            // Amount of data read from block in bytes
+  int bytes_read;       // Filterbank header size in bytes
+  char *h5buf[4];       // Host buffer for reading HDF5 data
+  char *dh5buf[4];      // Device buffer for reading HDF5 data
+  
+  // File output
+  char fname[462];      // Name of output filterbanks
+  char obsid[128]="cdmt";  // Prefix of the output filenames
+  int part=0;           // Part number (used for naming output files)
+  FILE **outfile;       // Pointer to filterbank outfiles
+  float *dfbuf;         // Device buffer for output
+  unsigned char *dcbuf; // Device buffer for redigitised output
+  unsigned char *cbuf;  // Host buffer for redigitised output
+
+  // DMs
+  float *dm,*ddm;      // Host/device arrays for DM steps
+  float dm_start;      // Start DM
+  float dm_step;       // DM step size
+  int ndm;             // Number of DM steps
+
+  // Forward FFT
+  int nsub=20;        // Number of subbands
+  int nchan=8;        // Number of channels per subband
+  int nbin=65536;     // Size of forward FFT
+  int noverlap=2048;  // Size of the overlap region
+  int nvalid;         // Number of non-overlapping bins
+  int nsamp;          // Number of samples per block
+  int nfft;           // Number of parallel FFTs
+  int ndec=1;         // Number of time samples to average
+
+  // Backward FFT
+  int mchan;          // Number of filterbank channels (nsub*nchan)
+  int mbin;           // Size of backward FFT (nbin/nchan)
+  int msamp;          // Number of block samples per channel (nsamp/nchan)
+  int msum=1024;      // Size of block sum
+  int mblock;         // Number of blocks (msamp/msum)
+
+  // CUDA
+  int device=0;             // GPU device code
+  cufftComplex *cp1p,*cp2p; // Complex timeseries
+  cufftComplex *cp1,*cp2;   // Dedispersed complex timeseries
+  cufftComplex *dc;         // Chirp
+  float *bs1,*bs2;          // Block sums
+  float *zavg,*zstd;        // Channel averages and standard deviations
+  cufftHandle ftc2cf;       // Forward FFT plan
+  cufftHandle ftc2cb;       // Backward FFT plan
+  int idist,odist,iembed,oembed,istride,ostride;  // FFT plan params
+  dim3 blocksize,gridsize;  // GPU mapping params
 
   // Read options
   if (argc>1) {
     while ((arg=getopt(argc,argv,"P:d:D:ho:b:N:n:"))!=-1) {
       switch (arg) {
 	
-      case 'n':
-	noverlap=atoi(optarg);
-	break;
+        case 'n':
+          noverlap=atoi(optarg);
+          break;
 
-      case 'N':
-	nbin=atoi(optarg);
-	break;
+        case 'N':
+          nbin=atoi(optarg);
+          break;
 
-      case 'b':
-	ndec=atoi(optarg);
-	break;
+        case 'b':
+          ndec=atoi(optarg);
+          break;
 
-      case 'o':
-	strcpy(obsid,optarg);
-	break;
-	
-      case 'P':
-	part=atoi(optarg);
-	break;
+        case 'o':
+          strcpy(obsid,optarg);
+          break;
+    
+        case 'P':
+          part=atoi(optarg);
+          break;
 
-      case 'D':
-	device=atoi(optarg);
-	break;
-	
-      case 'd':
-	sscanf(optarg,"%f,%f,%d",&dm_start,&dm_step,&ndm);
-	break;
+        case 'D':
+          device=atoi(optarg);
+          break;
+    
+        case 'd':
+          sscanf(optarg,"%f,%f,%d",&dm_start,&dm_step,&ndm);
+          break;
 
-      case 'h':
-	usage();
-	return 0;
+        case 'h':
+          usage();
+          return 0;
       }
     }
   } else {
     usage();
     return 0;
   }
+
+  // Parse the HDF5 file name
   h5fname=argv[optind];
   
   // Read HDF5 header
   h5=read_h5_header(h5fname);
-
 
   // Set number of subbands
   nsub=h5.nsub;
@@ -112,14 +152,12 @@ int main(int argc,char *argv[])
   checkCudaErrors(cudaMalloc((void **) &zstd,sizeof(float)*mchan));
 
   // Allocate memory for redigitized output and header
-  header=(char *) malloc(sizeof(char)*HEADERSIZE);
   for (i=0;i<4;i++) {
     h5buf[i]=(char *) malloc(sizeof(char)*nsamp*nsub);
     checkCudaErrors(cudaMalloc((void **) &dh5buf[i],sizeof(char)*nsamp*nsub));
   }
 
   // Allocate output buffers
-  fbuf=(float *) malloc(sizeof(float)*nsamp*nsub);
   checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
   cbuf=(unsigned char *) malloc(sizeof(unsigned char)*msamp*mchan/ndec);
   checkCudaErrors(cudaMalloc((void **) &dcbuf,sizeof(unsigned char)*msamp*mchan/ndec));
@@ -259,13 +297,11 @@ int main(int argc,char *argv[])
     fclose(rawfile[i]);
 
   // Free
-  free(header);
   for (i=0;i<4;i++) {
     free(h5buf[i]);
     cudaFree(dh5buf);
     free(h5.rawfname[i]);
   }
-  free(fbuf);
   free(dm);
   free(cbuf);
   free(outfile);
