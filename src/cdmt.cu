@@ -18,9 +18,8 @@ int main(int argc,char *argv[])
   char *dh5buf[4];      // Device buffer for reading HDF5 data
   
   // File output
-  char fname[462];      // Name of output filterbanks
+  char fname[256];      // Name of output filterbanks
   char obsid[128]="cdmt";  // Prefix of the output filenames
-  int part=0;           // Part number (used for naming output files)
   FILE **outfile;       // Pointer to filterbank outfiles
   float *dfbuf;         // Device buffer for output
   unsigned char *dcbuf; // Device buffer for redigitised output
@@ -28,11 +27,12 @@ int main(int argc,char *argv[])
 
   // DMs
   float *dm,*ddm;      // Host/device arrays for DM steps
-  float dm_start;      // Start DM
-  float dm_step;       // DM step size
-  int ndm;             // Number of DM steps
+  float dm_start=-1;   // Start DM
+  float dm_step=-1;    // DM step size
+  int ndm=-1;          // Number of DM steps
 
   // Forward FFT
+  int nforward=128;   // Number of forward FFTs per cuFFT call
   int nsub=20;        // Number of subbands
   int nchan=8;        // Number of channels per subband
   int nbin=65536;     // Size of forward FFT
@@ -63,40 +63,51 @@ int main(int argc,char *argv[])
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"P:d:D:ho:b:N:n:"))!=-1) {
+    while ((arg=getopt(argc,argv,"hd:D:b:N:n:s:c:m:o:"))!=-1) {
       switch (arg) {
-	
-        case 'n':
-          noverlap=atoi(optarg);
-          break;
 
-        case 'N':
-          nbin=atoi(optarg);
-          break;
+        case 'h':
+          usage();
+          return 0;
 
-        case 'b':
-          ndec=atoi(optarg);
-          break;
-
-        case 'o':
-          strcpy(obsid,optarg);
-          break;
-    
-        case 'P':
-          part=atoi(optarg);
+        case 'd':
+          sscanf(optarg,"%f,%f,%d",&dm_start,&dm_step,&ndm);
           break;
 
         case 'D':
           device=atoi(optarg);
           break;
-    
-        case 'd':
-          sscanf(optarg,"%f,%f,%d",&dm_start,&dm_step,&ndm);
+        
+        case 'b':
+          ndec=atoi(optarg);
           break;
 
-        case 'h':
-          usage();
-          return 0;
+        case 'N':
+          nbin=atoi(optarg);
+          break;
+	
+        case 'n':
+          noverlap=atoi(optarg);
+          break;
+
+        case 's':
+          nsub=atoi(optarg);
+          break;
+
+        case 'c':
+          nchan=atoi(optarg);
+          break;
+
+        case 'm':
+          msum=atoi(optarg);
+          break;
+
+        case 'o':
+          strcpy(obsid,optarg);
+          break;
+
+        default:
+          return 1;
       }
     }
   } else {
@@ -104,9 +115,93 @@ int main(int argc,char *argv[])
     return 0;
   }
 
-  // Parse the HDF5 file name
+  // Check required inputs were given
+  if ((dm_start == -1) || (dm_step == -1) || (ndm == -1)) {
+    fprintf(stderr, "ERROR :: DM parameters were not specified. Exiting.\n");
+    return 1;
+  }
+  if (argc <= optind) {
+    fprintf(stderr, "ERROR :: Failed to provide an input file. Exiting.\n");
+    return 1;
+  }
   h5fname=argv[optind];
-  
+
+  // Basic input checks
+  if (dm_start<0.0) {
+    fprintf(stderr, "ERROR :: Start DM must be a non-negative number (currently %f). Exiting.\n", dm_start);
+    return 1;
+  }
+  if (dm_step<=0.0) {
+    fprintf(stderr, "ERROR :: DM step size must be a positive number (currently %f). Exiting.\n", dm_step);
+    return 1;
+  }
+  if (ndm<1) {
+    fprintf(stderr, "ERROR :: Number of DM trials must be a positive integer (currently %d). Exiting.\n", ndm);
+    return 1;
+  }
+  if (ndec<1) {
+    fprintf(stderr, "ERROR :: Number of averages time samples must be a positive integer (currently %d). Exiting.\n", ndec);
+    return 1;
+  }
+  if (nbin<1) {
+    fprintf(stderr, "ERROR :: FFT size must be a positive integer (currently %d). Exiting.\n", nbin);
+    return 1;
+  }
+  if (noverlap<1) {
+    fprintf(stderr, "ERROR :: Overlap region must be a positive integer (currently %d). Exiting.\n", noverlap);
+    return 1;
+  }
+  if (nforward<1) {
+    fprintf(stderr, "ERROR :: Number of FFTs must be a positive integer (currently %d). Exiting.\n", nforward);
+    return 1;
+  }
+  if (nsub<1) {
+    fprintf(stderr, "ERROR :: Number of subbands must be a positive integer (currently %d). Exiting.\n", nsub);
+    return 1;
+  }
+  if (nchan<1) {
+    fprintf(stderr, "ERROR :: Channelisation factor must be a positive integer (currently %d). Exiting.\n", nchan);
+    return 1;
+  }
+  if (msum<1) {
+    fprintf(stderr, "ERROR :: Size of blocksum must be a positive integer (currently %d). Exiting.\n", msum);
+    return 1;
+  }
+
+  // Sanity checks
+  if (nbin % nchan != 0) {
+    fprintf(stderr, "ERROR :: nbin must be divisible by nchan (%d) (currently %d, remainder: %d). Exiting.\n", nchan, nbin, nbin % nchan);
+    return 1;
+  }
+  if (nbin-2*noverlap < 1) {
+    fprintf(stderr, "ERROR :: FFT size (%d) must be greater than twice the overlap region (%d). Exiting.\n", nbin, noverlap);
+    return 1;
+  }
+  if ((nforward * (nbin-2*noverlap)) % nchan != 0 ) {
+    fprintf(stderr, "ERROR :: Number of valid samples must be divisible by nchan (%d) (currently %d, remainer %d). Exiting.\n", nchan, nbin-2*noverlap, (nbin-2*noverlap) % nchan);
+    return 1;
+  }
+  if ((nforward * (nbin-2*noverlap) / nchan) % msum != 0) {
+    fprintf(stderr, "ERROR :: Number of valid samples must be divisible by msum (%d) (currently %d, remainder %d).\n", msum, (nforward * (nbin-2*noverlap) / nchan), (nforward * (nbin-2*noverlap) / nchan) % msum);
+    return 1;
+  }
+  if ((nforward * (nbin-2*noverlap)) % 128 != 0) {
+    fprintf(stderr, "ERROR :: Number of valid samples must be divisible by samples per packet (128) (currently %d, remainder %d). Exiting.\n", (nforward * (nbin-2*noverlap)), (nforward * (nbin-2*noverlap)) % 128);
+    return 1;
+  }
+
+  // File checks
+   if (access(h5fname, F_OK) == -1)
+  {
+    fprintf(stderr, "ERROR :: Input file does not exist (%s). Exiting.\n", h5fname);
+    return 1;
+  }
+  if (access(h5fname, R_OK) == -1)
+  {
+    fprintf(stderr, "ERROR :: Input file is not readable (%s). Exiting.\n", h5fname);
+    return 1;
+  }
+
   // Read HDF5 header
   h5=read_h5_header(h5fname);
 
@@ -122,12 +217,12 @@ int main(int argc,char *argv[])
 
   // Data size
   nvalid=nbin-2*noverlap;
-  nsamp=100*nvalid;
+  nsamp=nforward*nvalid;
   nfft=(int) ceil(nsamp/(float) nvalid);
-  mbin=nbin/nchan;
+  mbin=nbin/nchan;  // nbin must be divisible by nchan
   mchan=nsub*nchan;
-  msamp=nsamp/nchan;
-  mblock=msamp/msum;
+  msamp=nsamp/nchan;  // nforward * nvalid must be divisible by nchan
+  mblock=msamp/msum;  // nforward * nvalid / nchan must be divisible by msum
 
   printf("nbin: %d nfft: %d nsub: %d mbin: %d nchan: %d nsamp: %d nvalid: %d\n",nbin,nfft,nsub,mbin,nchan,nsamp,nvalid);
 
@@ -193,11 +288,11 @@ int main(int argc,char *argv[])
   // Format file names and open
   outfile=(FILE **) malloc(sizeof(FILE *)*ndm);
   for (idm=0;idm<ndm;idm++) {
-    sprintf(fname,"%s_cDM%06.2f_P%03d.fil",obsid,dm[idm],part);
+    sprintf(fname,"%s_cDM%06.2f.fil",obsid,dm[idm]);
 
     outfile[idm]=fopen(fname,"w");
   }
-  
+
   // Write headers
   for (idm=0;idm<ndm;idm++) {
     // Send header
@@ -328,16 +423,23 @@ int main(int argc,char *argv[])
 
 void usage()
 {
-  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -b <ndec> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
-  printf("Compute coherently dedispersed SIGPROC filterbank files from LOFAR complex voltage data in HDF5 format.\n");
-  printf("-P <part>        Specify part number for input file [integer, default: 0]\n");
-  printf("-D <GPU device>  Select GPU device [integer, default: 0]\n");
-  printf("-b <ndec>        Number of time samples to average [integer, default: 1]\n");
-  printf("-d <DM start, step, num>  DM start and stepsize, number of DM trials\n");
-  printf("-o <outputname>           Output filename [default: cdmt]\n");
-  printf("-N <forward FFT size>     Forward FFT size [integer, default: 65536]\n");
-  printf("-n <overlap region>       Overlap region [integer, default: 2048]\n");
-
+  printf("CDMT - Coherent Dispersion Measure Trials\n");
+  printf("Compute coherently dedispersed SIGPROC filterbank files from complex voltage data.\n\n");
+  printf("Usage:\n");
+  printf("  cdmt [options...] [header_file]\n\n");
+  printf("Arguments:\n");
+  printf("  header_file             The header file of the lowest subband\n\n");
+  printf("Options:\n");
+  printf("  -d <DM start,step,num>  DM start, stepsize, and number of trials\n");
+  printf("  -D <GPU device>         GPU device number to use (default: 0)\n");
+  printf("  -b <ndec>               Number of time samples to average (default: 1)\n");
+  printf("  -N <forward FFT size>   Forward FFT size (default: 32768)\n");
+  printf("  -n <overlap region>     Overlap region (default: 1024)\n");
+  printf("  -f <FFTs per op>        Number of FFTs per cuFFT call (default: 128)\n");
+  printf("  -s <nsub>               Number of input subbands (default: 24)\n");
+  printf("  -c <nchan>              Channelisation factor (default: 128)\n");
+  printf("  -m <msum>               Size of blocksum (default: 1920)\n");
+  printf("  -o <output prefix>      Output filename prefix (default: cdmt)\n");
   return;
 }
 
