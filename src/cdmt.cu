@@ -2,17 +2,20 @@
 
 int main(int argc,char *argv[])
 {
-  int arg=0;            // Command line inputs
-  int i,idm,iblock;     // Iterators
-  clock_t startclock;   // Clock time
+  int arg=0;             // Command line inputs
+  int i,idm,iblock;      // Iterators
+  clock_t startclock;    // Clock time
+  size_t cfsize, cbsize; // FFT sizes
+  size_t minfftsize;     // Min of cfsize and cbsize
+  size_t gpu_mems[2];    // Used/total GPU VRAM
 
   // File input
   char *h5fname;        // Name of first HDF5 metadata file
   FILE *file;           // Pointer to first HDF5 metadata file
-  FILE *rawfile[4];     // Pointers to all HDF5 raw file parts
+  FILE *input_files[4]; // Pointers to all HDF5 raw file parts
   struct header h5;     // Struct containing HDF5 header info
   char fheader[1024];   // Filterbank header string
-  int nread;            // Amount of data read from block in bytes
+  int nread,nread_tmp;  // Amount of data read from block in bytes
   int bytes_read;       // Filterbank header size in bytes
   char *h5buf[4];       // Host buffer for reading HDF5 data
   char *dh5buf[4];      // Device buffer for reading HDF5 data
@@ -20,7 +23,7 @@ int main(int argc,char *argv[])
   // File output
   char fname[256];      // Name of output filterbanks
   char obsid[128]="cdmt";  // Prefix of the output filenames
-  FILE **outfile;       // Pointer to filterbank outfiles
+  FILE **output_files;       // Pointer to filterbank output_filess
   float *dfbuf;         // Device buffer for output
   unsigned char *dcbuf; // Device buffer for redigitised output
   unsigned char *cbuf;  // Host buffer for redigitised output
@@ -63,7 +66,7 @@ int main(int argc,char *argv[])
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"hd:D:b:N:n:s:c:m:o:"))!=-1) {
+    while ((arg=getopt(argc,argv,"hd:D:b:N:n:f:s:c:m:o:"))!=-1) {
       switch (arg) {
 
         case 'h':
@@ -88,6 +91,10 @@ int main(int argc,char *argv[])
 	
         case 'n':
           noverlap=atoi(optarg);
+          break;
+
+        case 'f':
+          nforward=atoi(optarg);
           break;
 
         case 's':
@@ -116,11 +123,11 @@ int main(int argc,char *argv[])
   }
 
   // Check required inputs were given
-  if ((dm_start == -1) || (dm_step == -1) || (ndm == -1)) {
+  if ((dm_start==-1)||(dm_step==-1)||(ndm==-1)) {
     fprintf(stderr, "ERROR :: DM parameters were not specified. Exiting.\n");
     return 1;
   }
-  if (argc <= optind) {
+  if (argc<=optind) {
     fprintf(stderr, "ERROR :: Failed to provide an input file. Exiting.\n");
     return 1;
   }
@@ -148,7 +155,7 @@ int main(int argc,char *argv[])
     return 1;
   }
   if (noverlap<1) {
-    fprintf(stderr, "ERROR :: Overlap region must be a positive integer (currently %d). Exiting.\n", noverlap);
+    fprintf(stderr, "ERROR :: FFT overlap must be a positive integer (currently %d). Exiting.\n", noverlap);
     return 1;
   }
   if (nforward<1) {
@@ -174,10 +181,10 @@ int main(int argc,char *argv[])
     return 1;
   }
   if (nbin-2*noverlap < 1) {
-    fprintf(stderr, "ERROR :: FFT size (%d) must be greater than twice the overlap region (%d). Exiting.\n", nbin, noverlap);
+    fprintf(stderr, "ERROR :: FFT size (%d) must be greater than twice the FFT overlap (%d). Exiting.\n", nbin, noverlap);
     return 1;
   }
-  if ((nforward * (nbin-2*noverlap)) % nchan != 0 ) {
+  if ((nforward * (nbin-2*noverlap)) % nchan != 0) {
     fprintf(stderr, "ERROR :: Number of valid samples must be divisible by nchan (%d) (currently %d, remainer %d). Exiting.\n", nchan, nbin-2*noverlap, (nbin-2*noverlap) % nchan);
     return 1;
   }
@@ -191,12 +198,12 @@ int main(int argc,char *argv[])
   }
 
   // File checks
-   if (access(h5fname, F_OK) == -1)
+   if (access(h5fname, F_OK)==-1)
   {
     fprintf(stderr, "ERROR :: Input file does not exist (%s). Exiting.\n", h5fname);
     return 1;
   }
-  if (access(h5fname, R_OK) == -1)
+  if (access(h5fname, R_OK)==-1)
   {
     fprintf(stderr, "ERROR :: Input file is not readable (%s). Exiting.\n", h5fname);
     return 1;
@@ -204,6 +211,25 @@ int main(int argc,char *argv[])
 
   // Read HDF5 header
   h5=read_h5_header(h5fname);
+
+  // Check that the FFT size and overlap size are large enough
+  const double  stg1 = (1.0 / 2.41e-4) * abs(pow((double) h5.fch1 + h5.nsub * h5.foff + h5.foff *0.5,-2.0) - pow((double) h5.fch1 + h5.nsub * h5.foff - h5.foff *0.5, -2.0)) * (dm_start + dm_step * (ndm - 1));
+  const int overlap_check = (int) (stg1 / h5.tsamp);
+  if (overlap_check > nbin) {
+    fprintf(stderr, "WARNING :: The size of your FFT bin is too short for the given DMs and frequencies. Given bin size: %d, Suggested minimum bin size: %d (maximum dispersion delay %f).\n", nbin, overlap_check, stg1);
+  } else if (overlap_check / 2 > noverlap) {
+    fprintf(stderr, "WARNING :: The size of your FFT overlap is too short for the given maximum DM. Given overlap: %d, Suggested minimum overlap: %d (maximum dispersion delay %f).\n", noverlap, overlap_check / 2, stg1);
+  }
+
+  // Open input data files
+  for (i=0;i<4;i++) {
+    printf("Opening file %s\n", h5.rawfname[i]);
+    input_files[i]=fopen(h5.rawfname[i],"r");
+    if (input_files[i]==NULL) {
+      fprintf(stderr, "ERROR :: Input file failed to open (null pointer). Exiting.\n");
+      return 1;
+    }
+  }
 
   // Set number of subbands
   nsub=h5.nsub;
@@ -215,7 +241,7 @@ int main(int argc,char *argv[])
   h5.fch1=h5.fcen+0.5*h5.nsub*h5.bwchan-0.5*h5.bwchan/nchan;
   h5.foff=-fabs(h5.bwchan/nchan);
 
-  // Data size
+  // Data sizes
   nvalid=nbin-2*noverlap;
   nsamp=nforward*nvalid;
   nfft=(int) ceil(nsamp/(float) nvalid);
@@ -224,10 +250,50 @@ int main(int argc,char *argv[])
   msamp=nsamp/nchan;  // nforward * nvalid must be divisible by nchan
   mblock=msamp/msum;  // nforward * nvalid / nchan must be divisible by msum
 
-  printf("nbin: %d nfft: %d nsub: %d mbin: %d nchan: %d nsamp: %d nvalid: %d\n",nbin,nfft,nsub,mbin,nchan,nsamp,nvalid);
+  printf("\nUsing the following parameters:\n\n");
+  printf("         Num of subbands = %d\n", nsub);
+  printf("   Channelisation factor = %d\n", nchan);
+  printf("     Downsampling factor = %d\n", ndec);
+  printf("        Forward FFT size = %d\n", nbin);
+  printf("       Backward FFT size = %d\n", mbin);
+  printf("   Valid samples per FFT = %d\n", nvalid);
+  printf("             FFTs per op = %d\n", nfft);
+  printf("  Samples per forward op = %d\n", nsamp);
+  printf(" Samples per backward op = %d\n", msamp);
+  printf("       Size of block sum = %d\n", msum);
+  printf("       Num of block sums = %d\n\n", mblock);
 
   // Set device
   checkCudaErrors(cudaSetDevice(device));
+
+  // Generate FFT plan (batch in-place forward FFT)
+  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
+  checkCufftErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
+  checkCufftErrors(cufftGetSizeMany(ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub,&cfsize));
+
+  // Generate FFT plan (batch in-place backward FFT)
+  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
+  checkCufftErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
+  checkCufftErrors(cufftGetSizeMany(ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub,&cbsize));
+
+  // Get the maximum size needed for the FFT operations (they should be the same, check for safety)
+  minfftsize = cfsize > cbsize ? cfsize : cbsize;
+  printf("Allocated %ld MB for cuFFT work (saving %ld MB)\n", minfftsize >> 20, (cfsize + cbsize - minfftsize) >> 20);
+
+  // Predict the overall VRAM usage
+  long unsigned int bytes_used=\
+      sizeof(cufftComplex)*nbin*nfft*nsub*4 \
+    + sizeof(cufftComplex)*nbin*nsub*ndm \
+    + sizeof(float)*mblock*mchan*2 \
+    + sizeof(char)*nsamp*nsub*4 \
+    + sizeof(float)*nsamp*nsub \
+    + sizeof(unsigned char)*msamp*mchan/ndec \
+    + sizeof(float)*ndm;
+
+  // Get the total / available VRAM
+  checkCudaErrors(cudaMemGetInfo(&(gpu_mems[0]), &(gpu_mems[1])));
+  printf("Preparing for GPU memory allocations. Current memory usage: %ld / %ld GB\n", (gpu_mems[1] - gpu_mems[0]) >> 30, gpu_mems[1] >> 30);
+  printf("We anticipate %ld MB (%ld GB) to be allocated on the GPU (%ld MB for cuFFT planning).\n", (bytes_used + minfftsize) >> 20, (bytes_used + minfftsize) >> 30, minfftsize >> 20);
 
   // Allocate memory for complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
@@ -252,7 +318,7 @@ int main(int argc,char *argv[])
     checkCudaErrors(cudaMalloc((void **) &dh5buf[i],sizeof(char)*nsamp*nsub));
   }
 
-  // Allocate output buffers
+  // Allocate output buffers for final data products
   checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
   cbuf=(unsigned char *) malloc(sizeof(unsigned char)*msamp*mchan/ndec);
   checkCudaErrors(cudaMalloc((void **) &dcbuf,sizeof(unsigned char)*msamp*mchan/ndec));
@@ -264,13 +330,8 @@ int main(int argc,char *argv[])
   checkCudaErrors(cudaMalloc((void **) &ddm,sizeof(float)*ndm));
   checkCudaErrors(cudaMemcpy(ddm,dm,sizeof(float)*ndm,cudaMemcpyHostToDevice));
 
-  // Generate FFT plan (batch in-place forward FFT)
-  idist=nbin;  odist=nbin;  iembed=nbin;  oembed=nbin;  istride=1;  ostride=1;
-  checkCufftErrors(cufftPlanMany(&ftc2cf,1,&nbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nfft*nsub));
-
-  // Generate FFT plan (batch in-place backward FFT)
-  idist=mbin;  odist=mbin;  iembed=mbin;  oembed=mbin;  istride=1;  ostride=1;
-  checkCufftErrors(cufftPlanMany(&ftc2cb,1,&mbin,&iembed,istride,idist,&oembed,ostride,odist,CUFFT_C2C,nchan*nfft*nsub));
+  // Allow memory alloation/copy actions to finish before processing
+  cudaDeviceSynchronize();
 
   // Compute chirp
   blocksize.x=32; blocksize.y=32; blocksize.z=1;
@@ -279,40 +340,58 @@ int main(int argc,char *argv[])
 
   // Write temporary filterbank header
   file=fopen("/tmp/header.fil","w");
+  if (file==NULL) {
+    fprintf(stderr, "ERROR :: Unable to open /tmp/header.fil to write temporary header. Exiting.\n");
+    return 1;
+  }
   write_filterbank_header(h5,file);
   fclose(file);
   file=fopen("/tmp/header.fil","r");
+  if (file==NULL) {
+    fprintf(stderr, "ERROR :: Unable to open /tmp/header.fil to read temporary header length. Exiting.\n");
+    return 1;
+  }
   bytes_read=fread(fheader,sizeof(char),1024,file);
   fclose(file);
   
   // Format file names and open
-  outfile=(FILE **) malloc(sizeof(FILE *)*ndm);
+  output_files=(FILE **) malloc(sizeof(FILE *)*ndm);
   for (idm=0;idm<ndm;idm++) {
     sprintf(fname,"%s_cDM%06.2f.fil",obsid,dm[idm]);
 
-    outfile[idm]=fopen(fname,"w");
+    output_files[idm]=fopen(fname,"w");
+    if (output_files[idm]==NULL) {
+      fprintf(stderr, "ERROR :: Unable to open output file %s. Exiting.\n", fname);
+      return 1;
+    }
   }
 
   // Write headers
   for (idm=0;idm<ndm;idm++) {
     // Send header
-    fwrite(fheader,sizeof(char),bytes_read,outfile[idm]);
-  }
-
-  // Read files
-  for (i=0;i<4;i++) {
-    rawfile[i]=fopen(h5.rawfname[i],"r");
+    fwrite(fheader,sizeof(char),bytes_read,output_files[idm]);
   }
 
   // Loop over input file contents
+  nread=INT_MAX;
   for (iblock=0;;iblock++) {
     // Read block
     startclock=clock();
     for (i=0;i<4;i++)
-      nread=fread(h5buf[i],sizeof(char),nsamp*nsub,rawfile[i])/nsub;
-    if (nread==0)
-      break;
+      nread_tmp=fread(h5buf[i],sizeof(char),nsamp*nsub,input_files[i])/nsub;
+
+    if (nread > nread_tmp) {
+      nread = nread_tmp;
+    }
+
     printf("Block: %d: Read %lu MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
+
+    if (nread==0) {
+      printf("No data read from last block; assuming EOF, finishing up.\n");
+      break;
+    } else if (iblock != 0 && nread < nread_tmp) {
+      printf("Received less data than expected; we may have parsed out of order data or we are nearing the EOF.\n");
+    }      
 
     // Copy buffers to device
     startclock=clock();
@@ -322,7 +401,11 @@ int main(int argc,char *argv[])
     // Unpack data and padd data
     blocksize.x=32; blocksize.y=32; blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
-    unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+    if (iblock>0) {
+      unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+    } else {
+      unpack_and_padd_first_iteration<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+    }
 
     // Perform FFTs
     checkCufftErrors(cufftExecC2C(ftc2cf,(cufftComplex *) cp1p,(cufftComplex *) cp1p,CUFFT_FORWARD));
@@ -341,6 +424,13 @@ int main(int argc,char *argv[])
       gridsize.x=nbin*nsub/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=1;
       PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1p,dc,cp1,nbin*nsub,nfft,idm,1.0/(float) nbin);
       PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2p,dc,cp2,nbin*nsub,nfft,idm,1.0/(float) nbin);
+
+      // Padd the next iteration
+      if (idm==ndm-1) {
+        blocksize.x=32; blocksize.y=32; blocksize.z=1;
+        gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
+        padd_next_iteration<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+      }
       
       // Swap spectrum halves for small FFTs
       blocksize.x=32; blocksize.y=32; blocksize.z=1;
@@ -378,18 +468,18 @@ int main(int argc,char *argv[])
       checkCudaErrors(cudaMemcpy(cbuf,dcbuf,sizeof(unsigned char)*msamp*mchan/ndec,cudaMemcpyDeviceToHost));
 
       // Write buffer
-      fwrite(cbuf,sizeof(char),nread*nsub/ndec,outfile[idm]);
+      fwrite(cbuf,sizeof(char),nread*nsub/ndec,output_files[idm]);
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
 
   // Close files
   for (i=0;i<ndm;i++)
-    fclose(outfile[i]);
+    fclose(output_files[i]);
 
   // Close files
   for (i=0;i<4;i++)
-    fclose(rawfile[i]);
+    fclose(input_files[i]);
 
   // Free
   for (i=0;i<4;i++) {
@@ -399,7 +489,7 @@ int main(int argc,char *argv[])
   }
   free(dm);
   free(cbuf);
-  free(outfile);
+  free(output_files);
 
   cudaFree(dfbuf);
   cudaFree(dcbuf);
@@ -434,7 +524,7 @@ void usage()
   printf("  -D <GPU device>         GPU device number to use (default: 0)\n");
   printf("  -b <ndec>               Number of time samples to average (default: 1)\n");
   printf("  -N <forward FFT size>   Forward FFT size (default: 32768)\n");
-  printf("  -n <overlap region>     Overlap region (default: 1024)\n");
+  printf("  -n <overlap size>       FFT overlap size (default: 1024)\n");
   printf("  -f <FFTs per op>        Number of FFTs per cuFFT call (default: 128)\n");
   printf("  -s <nsub>               Number of input subbands (default: 24)\n");
   printf("  -c <nchan>              Channelisation factor (default: 128)\n");
@@ -540,15 +630,11 @@ __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,
 
   // Only compute valid threads
   if (ibin<nbin && ifft<nfft && isub<nsub) {
-    idx1=ibin+nbin*isub+nsub*nbin*ifft;
     isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
-    idx2=isub+nsub*isamp;
-    if (isamp<0 || isamp>=nsamp) {
-      cp1[idx1].x=0.0;
-      cp1[idx1].y=0.0;
-      cp2[idx1].x=0.0;
-      cp2[idx1].y=0.0;
-    } else {
+    if (isamp >= noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(isamp-noverlap);
+
       cp1[idx1].x=(float) dbuf0[idx2];
       cp1[idx1].y=(float) dbuf1[idx2];
       cp2[idx1].x=(float) dbuf2[idx2];
@@ -557,6 +643,80 @@ __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,
   }
 
   return;
+}
+
+// Unpack the input buffer and generate complex timeseries. The output
+// timeseries are padded with noverlap samples on either side for the
+// convolution. This is separate from the main kernel to minimise performance
+// loss to branching on the GPU. On the first iteration, we want to fill
+// the final non-noverlap region and final noverlap region so that they can 
+// match the first noverlap region and first non-noverlap on the second
+// iteration
+__global__ void unpack_and_padd_first_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+{
+  int64_t ibin,ifft,isamp,isub,idx1,idx2;
+
+  // Indices of input data
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+  isub=blockIdx.z*blockDim.z+threadIdx.z;
+
+  // Only compute valid threads
+  if (ibin<nbin && ifft<nfft && isub<nsub) {
+    isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
+    if (isamp >= noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(isamp-noverlap);
+
+      cp1[idx1].x=(float) dbuf0[idx2];
+      cp1[idx1].y=(float) dbuf1[idx2];
+      cp2[idx1].x=(float) dbuf2[idx2];
+      cp2[idx1].y=(float) dbuf3[idx2];
+    } else if (isamp > -noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(noverlap-isamp);
+
+      cp1[idx1].x=(float) dbuf0[idx2];
+      cp1[idx1].y=(float) dbuf1[idx2];
+      cp2[idx1].x=(float) dbuf2[idx2];
+      cp2[idx1].y=(float) dbuf3[idx2];
+    }
+  }
+
+  return;
+}
+
+// Unpack the input buffer and generate complex timeseries. The output
+// timeseries are located in the first noverlap region and first non-
+// noverlap region, for continuous time series between data blocks
+// 
+// overlap_(timeblock)_(index)
+// t = 0: overlap_0_0: nfft_0_0, nfft_0_1... nfft_0_N-1, nfft_0 N: overlap_0_1
+// t = 1: nfft_0_N: overlap_0_1, nfft_1_0.... nfft_1_N-1:overlap_1_1
+// t = 2 nfft_1_N-1: overlap_1_1...
+// etc
+__global__ void padd_next_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+{
+  int64_t ibin,ifft,isamp,isub,idx1,idx2;
+
+  // Indices of input data
+  ibin=blockIdx.x*blockDim.x+threadIdx.x;
+  ifft=blockIdx.y*blockDim.y+threadIdx.y;
+  isub=blockIdx.z*blockDim.z+threadIdx.z;
+
+  // Only compute valid threads
+  if (ibin<nbin && ifft<nfft && isub<nsub) {
+    isamp=ibin+(nbin-2*noverlap)*ifft;
+    if (isamp<2*noverlap) {
+      idx1=ibin+nbin*isub+nsub*nbin*ifft;
+      idx2=isub+nsub*(isamp+nsamp-2*noverlap);
+
+      cp1[idx1].x=(float) dbuf0[idx2];
+      cp1[idx1].y=(float) dbuf1[idx2];
+      cp2[idx1].x=(float) dbuf2[idx2];
+      cp2[idx1].y=(float) dbuf3[idx2];
+    }
+  }
 }
 
 // Since complex-to-complex FFTs put the center frequency at bin zero
