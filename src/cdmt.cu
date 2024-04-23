@@ -4,29 +4,34 @@ int main(int argc,char *argv[])
 {
   int arg=0;             // Command line inputs
   int i,idm,iblock;      // Iterators
+  int rv;                // Return value
   clock_t startclock;    // Clock time
   size_t cfsize, cbsize; // FFT sizes
   size_t minfftsize;     // Min of cfsize and cbsize
   size_t gpu_mems[2];    // Used/total GPU VRAM
 
+  // VDIF file input
+  struct vdif_file *vf;
+
   // File input
-  char *h5fname;        // Name of first HDF5 metadata file
-  FILE *file;           // Pointer to first HDF5 metadata file
-  FILE *input_files[4]; // Pointers to all HDF5 raw file parts
-  struct header h5;     // Struct containing HDF5 header info
-  char fheader[1024];   // Filterbank header string
-  int nread,nread_tmp;  // Amount of data read from block in bytes
-  int bytes_read;       // Filterbank header size in bytes
-  char *h5buf[4];       // Host buffer for reading HDF5 data
-  char *dh5buf[4];      // Device buffer for reading HDF5 data
+  char *hdrfname;        // Name of first HDF5 metadata file
+  FILE *file;            // Pointer to first HDF5 metadata file
+  FILE **input_files;    // Pointers to array of raw file names
+  char fheader[1024];    // Filterbank header string
+  int nread,nread_tmp;   // Amount of data read from block in bytes
+  int bytes_read;        // Filterbank header size in bytes
+  char *vfbuf;           // Host buffer for reading VDIF data
+  char *tmp_vfbuf;       // Host buffer for reading VDIF data
+  char *dvfbuf;          // Device buffer for reading VDIF data
   
   // File output
-  char fname[256];      // Name of output filterbanks
+  char fname[256];         // Name of output filterbanks
   char obsid[128]="cdmt";  // Prefix of the output filenames
-  FILE **output_files;       // Pointer to filterbank output_filess
-  float *dfbuf;         // Device buffer for output
-  unsigned char *dcbuf; // Device buffer for redigitised output
-  unsigned char *cbuf;  // Host buffer for redigitised output
+  char src_name[256]="\0"; // Source name override
+  FILE **output_files;     // Pointer to filterbank output_filess
+  float *dfbuf;            // Device buffer for output
+  unsigned char *dcbuf;    // Device buffer for redigitised output
+  unsigned char *cbuf;     // Host buffer for redigitised output
 
   // DMs
   float *dm,*ddm;      // Host/device arrays for DM steps
@@ -36,12 +41,13 @@ int main(int argc,char *argv[])
 
   // Forward FFT
   int nforward=128;   // Number of forward FFTs per cuFFT call
-  int nsub=20;        // Number of subbands
-  int nchan=8;        // Number of channels per subband
-  int nbin=65536;     // Size of forward FFT
-  int noverlap=2048;  // Size of the overlap region
+  int nsub=24;        // Number of subbands
+  int nchan=128;      // Number of channels per subband
+  int nbin=32768;     // Size of forward FFT
+  int noverlap=1024;  // Size of the overlap region
   int nvalid;         // Number of non-overlapping bins
   int nsamp;          // Number of samples per block
+  int nframe;         // Number of VDIF frames per block
   int nfft;           // Number of parallel FFTs
   int ndec=1;         // Number of time samples to average
 
@@ -49,7 +55,7 @@ int main(int argc,char *argv[])
   int mchan;          // Number of filterbank channels (nsub*nchan)
   int mbin;           // Size of backward FFT (nbin/nchan)
   int msamp;          // Number of block samples per channel (nsamp/nchan)
-  int msum=1024;      // Size of block sum
+  int msum=1920;      // Size of block sum
   int mblock;         // Number of blocks (msamp/msum)
 
   // CUDA
@@ -66,7 +72,7 @@ int main(int argc,char *argv[])
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"hd:D:b:N:n:f:s:c:m:o:"))!=-1) {
+    while ((arg=getopt(argc,argv,"hd:D:b:N:n:f:s:c:m:o:p:"))!=-1) {
       switch (arg) {
 
         case 'h':
@@ -113,6 +119,10 @@ int main(int argc,char *argv[])
           strcpy(obsid,optarg);
           break;
 
+        case 'p':
+          strcpy(src_name,optarg);
+          break;
+
         default:
           return 1;
       }
@@ -131,7 +141,7 @@ int main(int argc,char *argv[])
     fprintf(stderr, "ERROR :: Failed to provide an input file. Exiting.\n");
     return 1;
   }
-  h5fname=argv[optind];
+  hdrfname=argv[optind];
 
   // Basic input checks
   if (dm_start<0.0) {
@@ -193,28 +203,43 @@ int main(int argc,char *argv[])
     return 1;
   }
   if ((nforward * (nbin-2*noverlap)) % 128 != 0) {
-    fprintf(stderr, "ERROR :: Number of valid samples must be divisible by samples per packet (128) (currently %d, remainder %d). Exiting.\n", (nforward * (nbin-2*noverlap)), (nforward * (nbin-2*noverlap)) % 128);
+    fprintf(stderr, "ERROR :: Number of valid samples must be divisible by the number of time samples per frame (128) (currently %d, remainder %d). Exiting.\n", (nforward * (nbin-2*noverlap)), (nforward * (nbin-2*noverlap)) % 128);
     return 1;
   }
 
   // File checks
-   if (access(h5fname, F_OK)==-1)
+   if (access(hdrfname, F_OK)==-1)
   {
-    fprintf(stderr, "ERROR :: Input file does not exist (%s). Exiting.\n", h5fname);
+    fprintf(stderr, "ERROR :: Input file does not exist (%s). Exiting.\n", hdrfname);
     return 1;
   }
-  if (access(h5fname, R_OK)==-1)
+  if (access(hdrfname, R_OK)==-1)
   {
-    fprintf(stderr, "ERROR :: Input file is not readable (%s). Exiting.\n", h5fname);
+    fprintf(stderr, "ERROR :: Input file is not readable (%s). Exiting.\n", hdrfname);
     return 1;
   }
 
-  // Read HDF5 header
-  h5=read_h5_header(h5fname);
+  // Initialise struct of VDIF file information
+  vf=init_vdif_struct(nsub);
+
+  // Read data from ascii header and store it in VDIF struct
+  rv=parse_ascii_header(vf,nsub,hdrfname,src_name);
+  if (rv!=0) {
+    free_vdif_struct(vf,nsub);
+    return 1;
+  }
+
+  // Update header information
+  vf->nsub=nsub;
+  vf->tsamp*=nchan*ndec;
+  vf->nchan=nsub*nchan;
+  vf->nbit=8;
+  vf->fch1=vf->fcen+0.5*vf->nsub*vf->bwchan-0.5*vf->bwchan/nchan;
+  vf->foff=-fabs(vf->bwchan/nchan);
 
   // Check that the FFT size and overlap size are large enough
-  const double  stg1 = (1.0 / 2.41e-4) * abs(pow((double) h5.fch1 + h5.nsub * h5.foff + h5.foff *0.5,-2.0) - pow((double) h5.fch1 + h5.nsub * h5.foff - h5.foff *0.5, -2.0)) * (dm_start + dm_step * (ndm - 1));
-  const int overlap_check = (int) (stg1 / h5.tsamp);
+  const double  stg1 = (1.0 / 2.41e-4) * abs(pow((double) vf->fch1 + nsub * vf->foff + vf->foff *0.5,-2.0) - pow((double) vf->fch1 + vf->nsub * vf->foff - vf->foff *0.5, -2.0)) * (dm_start + dm_step * (ndm - 1));
+  const int overlap_check = (int) (stg1 / vf->tsamp);
   if (overlap_check > nbin) {
     fprintf(stderr, "WARNING :: The size of your FFT bin is too short for the given DMs and frequencies. Given bin size: %d, Suggested minimum bin size: %d (maximum dispersion delay %f).\n", nbin, overlap_check, stg1);
   } else if (overlap_check / 2 > noverlap) {
@@ -222,28 +247,20 @@ int main(int argc,char *argv[])
   }
 
   // Open input data files
-  for (i=0;i<4;i++) {
-    printf("Opening file %s\n", h5.rawfname[i]);
-    input_files[i]=fopen(h5.rawfname[i],"r");
+  input_files=(FILE **) malloc(sizeof(FILE *)*nsub);
+  for (i=0;i<nsub;i++) {
+    printf("Opening file %s\n", vf->datafns[i]);
+    input_files[i]=fopen(vf->datafns[i],"r");
     if (input_files[i]==NULL) {
       fprintf(stderr, "ERROR :: Input file failed to open (null pointer). Exiting.\n");
       return 1;
     }
   }
 
-  // Set number of subbands
-  nsub=h5.nsub;
-
-  // Adjust header for filterbank format
-  h5.tsamp*=nchan*ndec;
-  h5.nchan=nsub*nchan;
-  h5.nbit=8;
-  h5.fch1=h5.fcen+0.5*h5.nsub*h5.bwchan-0.5*h5.bwchan/nchan;
-  h5.foff=-fabs(h5.bwchan/nchan);
-
   // Data sizes
   nvalid=nbin-2*noverlap;
   nsamp=nforward*nvalid;
+  nframe=4*nsamp/VDIF_DATA_BYTES;
   nfft=(int) ceil(nsamp/(float) nvalid);
   mbin=nbin/nchan;  // nbin must be divisible by nchan
   mchan=nsub*nchan;
@@ -282,11 +299,12 @@ int main(int argc,char *argv[])
 
   // Predict the overall VRAM usage
   long unsigned int bytes_used=\
-      sizeof(cufftComplex)*nbin*nfft*nsub*4 \
+      sizeof(char)*nsamp*nsub*4 \
+    + sizeof(cufftComplex)*nbin*nfft*nsub*4 \
     + sizeof(cufftComplex)*nbin*nsub*ndm \
-    + sizeof(float)*mblock*mchan*2 \
-    + sizeof(char)*nsamp*nsub*4 \
     + sizeof(float)*nsamp*nsub \
+    + sizeof(float)*mblock*mchan*2 \
+    + sizeof(float)*mchan*2 \
     + sizeof(unsigned char)*msamp*mchan/ndec \
     + sizeof(float)*ndm;
 
@@ -295,7 +313,12 @@ int main(int argc,char *argv[])
   printf("Preparing for GPU memory allocations. Current memory usage: %ld / %ld GB\n", (gpu_mems[1] - gpu_mems[0]) >> 30, gpu_mems[1] >> 30);
   printf("We anticipate %ld MB (%ld GB) to be allocated on the GPU (%ld MB for cuFFT planning).\n", (bytes_used + minfftsize) >> 20, (bytes_used + minfftsize) >> 30, minfftsize >> 20);
 
-  // Allocate memory for complex timeseries
+  // Allocate memory for raw complex timeseries
+  vfbuf=(char *) malloc(sizeof(char)*nsamp*nsub*4);
+  tmp_vfbuf=(char *) malloc(nframe*VDIF_FRAME_BYTES);
+  checkCudaErrors(cudaMalloc((void **) &dvfbuf,sizeof(char)*nsamp*nsub*4));
+
+  // Allocate memory for unpacked complex timeseries
   checkCudaErrors(cudaMalloc((void **) &cp1,sizeof(cufftComplex)*nbin*nfft*nsub));
   checkCudaErrors(cudaMalloc((void **) &cp2,sizeof(cufftComplex)*nbin*nfft*nsub));
   checkCudaErrors(cudaMalloc((void **) &cp1p,sizeof(cufftComplex)*nbin*nfft*nsub));
@@ -303,6 +326,9 @@ int main(int argc,char *argv[])
 
   // Allocate device memory for chirp
   checkCudaErrors(cudaMalloc((void **) &dc,sizeof(cufftComplex)*nbin*nsub*ndm));
+
+  // Allocate memory for detected data
+  checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
 
   // Allocate device memory for block sums
   checkCudaErrors(cudaMalloc((void **) &bs1,sizeof(float)*mblock*mchan));
@@ -312,14 +338,7 @@ int main(int argc,char *argv[])
   checkCudaErrors(cudaMalloc((void **) &zavg,sizeof(float)*mchan));
   checkCudaErrors(cudaMalloc((void **) &zstd,sizeof(float)*mchan));
 
-  // Allocate memory for redigitized output and header
-  for (i=0;i<4;i++) {
-    h5buf[i]=(char *) malloc(sizeof(char)*nsamp*nsub);
-    checkCudaErrors(cudaMalloc((void **) &dh5buf[i],sizeof(char)*nsamp*nsub));
-  }
-
-  // Allocate output buffers for final data products
-  checkCudaErrors(cudaMalloc((void **) &dfbuf,sizeof(float)*nsamp*nsub));
+  // Allocate output buffers for redigitized data
   cbuf=(unsigned char *) malloc(sizeof(unsigned char)*msamp*mchan/ndec);
   checkCudaErrors(cudaMalloc((void **) &dcbuf,sizeof(unsigned char)*msamp*mchan/ndec));
 
@@ -336,7 +355,7 @@ int main(int argc,char *argv[])
   // Compute chirp
   blocksize.x=32; blocksize.y=32; blocksize.z=1;
   gridsize.x=nsub/blocksize.x+1; gridsize.y=nchan/blocksize.y+1; gridsize.z=ndm/blocksize.z+1;
-  compute_chirp<<<gridsize,blocksize>>>(h5.fcen,nsub*h5.bwchan,ddm,nchan,nbin,nsub,ndm,dc);
+  compute_chirp<<<gridsize,blocksize>>>(vf->fcen,nsub*vf->bwchan,ddm,nchan,nbin,nsub,ndm,dc);
 
   // Write temporary filterbank header
   file=fopen("/tmp/header.fil","w");
@@ -344,7 +363,7 @@ int main(int argc,char *argv[])
     fprintf(stderr, "ERROR :: Unable to open /tmp/header.fil to write temporary header. Exiting.\n");
     return 1;
   }
-  write_filterbank_header(h5,file);
+  write_filterbank_header(vf,file);
   fclose(file);
   file=fopen("/tmp/header.fil","r");
   if (file==NULL) {
@@ -374,37 +393,43 @@ int main(int argc,char *argv[])
 
   // Loop over input file contents
   nread=INT_MAX;
+  nread_tmp=-1;
   for (iblock=0;;iblock++) {
+    // Reset vfbuf memory
+    memset(vfbuf,0,sizeof(char)*nsamp*nsub*4);
+
     // Read block
     startclock=clock();
-    for (i=0;i<4;i++)
-      nread_tmp=fread(h5buf[i],sizeof(char),nsamp*nsub,input_files[i])/nsub;
-
-    if (nread > nread_tmp) {
-      nread = nread_tmp;
-    }
+    for (i=0;i<nsub;i++)
+      nread_tmp=read_block_and_strip(input_files[i],vfbuf,tmp_vfbuf,i,nframe);
+    
+    // Check for error
+    if (nread_tmp==-1)
+      break;
+    
+    if (nread>nread_tmp)
+      nread=nread_tmp;
 
     printf("Block: %d: Read %lu MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     if (nread==0) {
       printf("No data read from last block; assuming EOF, finishing up.\n");
       break;
-    } else if (iblock != 0 && nread < nread_tmp) {
+    } else if (iblock!=0 && nread<nread_tmp) {
       printf("Received less data than expected; we may have parsed out of order data or we are nearing the EOF.\n");
     }      
 
     // Copy buffers to device
     startclock=clock();
-    for (i=0;i<4;i++)
-      checkCudaErrors(cudaMemcpy(dh5buf[i],h5buf[i],sizeof(char)*nread*nsub,cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(dvfbuf,vfbuf,sizeof(char)*nread*nsub*4,cudaMemcpyHostToDevice));
 
     // Unpack data and padd data
     blocksize.x=32; blocksize.y=32; blocksize.z=1;
     gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
     if (iblock>0) {
-      unpack_and_padd<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+      unpack_and_padd<<<gridsize,blocksize>>>(dvfbuf,nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
     } else {
-      unpack_and_padd_first_iteration<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+      unpack_and_padd_first_iteration<<<gridsize,blocksize>>>(dvfbuf,nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
     }
 
     // Perform FFTs
@@ -429,7 +454,7 @@ int main(int argc,char *argv[])
       if (idm==ndm-1) {
         blocksize.x=32; blocksize.y=32; blocksize.z=1;
         gridsize.x=nbin/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=nsub/blocksize.z+1;
-        padd_next_iteration<<<gridsize,blocksize>>>(dh5buf[0],dh5buf[1],dh5buf[2],dh5buf[3],nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
+        padd_next_iteration<<<gridsize,blocksize>>>(dvfbuf,nread,nbin,nfft,nsub,noverlap,cp1p,cp2p);
       }
       
       // Swap spectrum halves for small FFTs
@@ -473,24 +498,25 @@ int main(int argc,char *argv[])
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
   }
 
-  // Close files
+  // Close output files
   for (i=0;i<ndm;i++)
     fclose(output_files[i]);
 
-  // Close files
-  for (i=0;i<4;i++)
+  // Close input files
+  for (i=0;i<nsub;i++)
     fclose(input_files[i]);
 
-  // Free
-  for (i=0;i<4;i++) {
-    free(h5buf[i]);
-    cudaFree(dh5buf);
-    free(h5.rawfname[i]);
-  }
+  // Free host memory
+  free_vdif_struct(vf,nsub);
+  free(vfbuf);
+  free(tmp_vfbuf);
   free(dm);
   free(cbuf);
   free(output_files);
-
+  free(input_files);
+  
+  // Free device memory
+  cudaFree(dvfbuf);
   cudaFree(dfbuf);
   cudaFree(dcbuf);
   cudaFree(cp1);
@@ -507,6 +533,8 @@ int main(int argc,char *argv[])
   // Free plan
   cufftDestroy(ftc2cf);
   cufftDestroy(ftc2cb);
+
+  checkCudaErrors(cudaDeviceReset());
 
   return 0;
 }
@@ -530,6 +558,7 @@ void usage()
   printf("  -c <nchan>              Channelisation factor (default: 128)\n");
   printf("  -m <msum>               Size of blocksum (default: 1920)\n");
   printf("  -o <output prefix>      Output filename prefix (default: cdmt)\n");
+  printf("  -p <source name>        Source name (default: from .hdr file)\n");
   return;
 }
 
@@ -619,7 +648,7 @@ __global__ void compute_chirp(double fcen,double bw,float *dm,int nchan,int nbin
 // Unpack the input buffer and generate complex timeseries. The output
 // timeseries are padded with noverlap samples on either side for the
 // convolution.
-__global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+__global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
 {
   int64_t ibin,ifft,isamp,isub,idx1,idx2;
 
@@ -633,12 +662,12 @@ __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,
     isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
     if (isamp >= noverlap) {
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
-      idx2=isub+nsub*(isamp-noverlap);
+      idx2=4*nsamp*isub+4*(isamp-noverlap);
 
-      cp1[idx1].x=(float) dbuf0[idx2];
-      cp1[idx1].y=(float) dbuf1[idx2];
-      cp2[idx1].x=(float) dbuf2[idx2];
-      cp2[idx1].y=(float) dbuf3[idx2];
+      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
+      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
+      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
+      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
     }
   }
 
@@ -652,7 +681,7 @@ __global__ void unpack_and_padd(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,
 // the final non-noverlap region and final noverlap region so that they can 
 // match the first noverlap region and first non-noverlap on the second
 // iteration
-__global__ void unpack_and_padd_first_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+__global__ void unpack_and_padd_first_iteration(char *dbuf,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
 {
   int64_t ibin,ifft,isamp,isub,idx1,idx2;
 
@@ -666,20 +695,20 @@ __global__ void unpack_and_padd_first_iteration(char *dbuf0,char *dbuf1,char *db
     isamp=ibin+(nbin-2*noverlap)*ifft-noverlap;
     if (isamp >= noverlap) {
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
-      idx2=isub+nsub*(isamp-noverlap);
+      idx2=4*nsamp*isub+4*(isamp-noverlap);
 
-      cp1[idx1].x=(float) dbuf0[idx2];
-      cp1[idx1].y=(float) dbuf1[idx2];
-      cp2[idx1].x=(float) dbuf2[idx2];
-      cp2[idx1].y=(float) dbuf3[idx2];
+      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
+      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
+      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
+      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
     } else if (isamp > -noverlap) {
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
-      idx2=isub+nsub*(noverlap-isamp);
+      idx2=4*nsamp*isub+4*(noverlap-isamp);
 
-      cp1[idx1].x=(float) dbuf0[idx2];
-      cp1[idx1].y=(float) dbuf1[idx2];
-      cp2[idx1].x=(float) dbuf2[idx2];
-      cp2[idx1].y=(float) dbuf3[idx2];
+      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
+      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
+      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
+      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
     }
   }
 
@@ -695,7 +724,7 @@ __global__ void unpack_and_padd_first_iteration(char *dbuf0,char *dbuf1,char *db
 // t = 1: nfft_0_N: overlap_0_1, nfft_1_0.... nfft_1_N-1:overlap_1_1
 // t = 2 nfft_1_N-1: overlap_1_1...
 // etc
-__global__ void padd_next_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *dbuf3,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
+__global__ void padd_next_iteration(char *dbuf,int nsamp,int nbin,int nfft,int nsub,int noverlap,cufftComplex *cp1,cufftComplex *cp2)
 {
   int64_t ibin,ifft,isamp,isub,idx1,idx2;
 
@@ -709,12 +738,12 @@ __global__ void padd_next_iteration(char *dbuf0,char *dbuf1,char *dbuf2,char *db
     isamp=ibin+(nbin-2*noverlap)*ifft;
     if (isamp<2*noverlap) {
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
-      idx2=isub+nsub*(isamp+nsamp-2*noverlap);
+      idx2=4*nsamp*isub+4*(isamp+nsamp-2*noverlap);
 
-      cp1[idx1].x=(float) dbuf0[idx2];
-      cp1[idx1].y=(float) dbuf1[idx2];
-      cp2[idx1].x=(float) dbuf2[idx2];
-      cp2[idx1].y=(float) dbuf3[idx2];
+      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
+      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
+      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
+      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
     }
   }
 }

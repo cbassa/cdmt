@@ -9,14 +9,14 @@ extern "C" {
 #include <string.h>
 #include <math.h>
 
-#include "read_hdf5.h"
+#include "read_vdif.h"
 
 static void send_string(const char *string,FILE *file);
 static void send_float(const char *string,float x,FILE *file);
 static void send_int(const char *string,int x,FILE *file);
 static void send_double(const char *string,double x,FILE *file);
-static double dec2sex(double x);
-void write_filterbank_header(struct header h,FILE *file);
+double ascii2double(char *ascii_coord);
+void write_filterbank_header(struct vdif_file *vf,FILE *file);
 
 #ifdef __cplusplus
 }

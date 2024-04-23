@@ -8,7 +8,7 @@ void __checkCudaErrors(cudaError_t code, const char *file, int line)
 
     if (code != 0)
     {
-        fprintf(stderr, "CUDA Error :: %s - %s (%d)\n", cudaGetErrorString(code), file, line);
+        fprintf(stderr, "CUDA Error :: %s - %s (line %d)\n", cudaGetErrorString(code), file, line);
         exit(code);
     }
 }

@@ -35,53 +35,47 @@ static void send_double(const char *string,double x,FILE *file)
   return;
 }
 
-static double dec2sex(double x)
+double ascii2double(char *ascii_coord)
 {
-  double d,sec,min,deg;
+  double double_coord;
+  double deg,min,sec;  // degrees/hours, minutes, seconds
   char sign;
   char tmp[32];
 
-  sign=(x<0 ? '-' : ' ');
-  x=3600.0*fabs(x);
-
-  sec=fmod(x,60.0);
-  x=(x-sec)/60.0;
-  min=fmod(x,60.0);
-  x=(x-min)/60.0;
-  deg=x;
-
-  sprintf(tmp,"%c%02d%02d%09.6lf",sign,(int) deg,(int) min,sec);
-  sscanf(tmp,"%lf",&d);
-
-  return d;
+  if (strlen(ascii_coord)==0)
+    return 0.0;
+  sscanf(ascii_coord,"%lf:%lf:%lf",&deg,&min,&sec);
+  sign=(deg<0 ? '-' : ' ');
+  sprintf(tmp,"%c%02d%02d%09.6lf",sign,abs((int) deg),(int) min,sec);
+  sscanf(tmp,"%lf",&double_coord);
+  return double_coord;
 }
 
-void write_filterbank_header(struct header h,FILE *file)
+void write_filterbank_header(struct vdif_file *vf,FILE *file)
 {
   double ra,de;
 
-
-  ra=dec2sex(h.src_raj/15.0);
-  de=dec2sex(h.src_dej);
+  ra=ascii2double(vf->src_raj);
+  de=ascii2double(vf->src_dej);
   
   send_string("HEADER_START",file);
   send_string("rawdatafile",file);
-  send_string(h.rawfname[0],file);
+  send_string(vf->lowdatafn,file);
   send_string("source_name",file);
-  send_string(h.source_name,file);
-  send_int("machine_id",11,file);
-  send_int("telescope_id",11,file);
+  send_string(vf->src_name,file);
+  send_int("machine_id",30,file);
+  send_int("telescope_id",30,file);
   send_double("src_raj",ra,file);
   send_double("src_dej",de,file);
   send_int("data_type",1,file);
-  send_double("fch1",h.fch1,file);
-  send_double("foff",h.foff,file);
-  send_int("nchans",h.nchan,file);
+  send_double("fch1",vf->fch1,file);
+  send_double("foff",vf->foff,file);
+  send_int("nchans",vf->nchan,file);
   send_int("nbeams",0,file);
   send_int("ibeam",0,file);
-  send_int("nbits",h.nbit,file);
-  send_double("tstart",h.tstart,file);
-  send_double("tsamp",h.tsamp,file);
+  send_int("nbits",vf->nbit,file);
+  send_double("tstart",vf->tstart,file);
+  send_double("tsamp",vf->tsamp,file);
   send_int("nifs",1,file);
   send_string("HEADER_END",file);
 
