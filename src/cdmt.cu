@@ -42,7 +42,7 @@ int main(int argc,char *argv[])
   // Forward FFT
   int nforward=128;   // Number of forward FFTs per cuFFT call
   int nsub=24;        // Number of subbands
-  int nchan=128;      // Number of channels per subband
+  int nchan=32;       // Number of channels per subband
   int nbin=32768;     // Size of forward FFT
   int noverlap=1024;  // Size of the overlap region
   int nvalid;         // Number of non-overlapping bins
@@ -55,7 +55,7 @@ int main(int argc,char *argv[])
   int mchan;          // Number of filterbank channels (nsub*nchan)
   int mbin;           // Size of backward FFT (nbin/nchan)
   int msamp;          // Number of block samples per channel (nsamp/nchan)
-  int msum=1920;      // Size of block sum
+  int msum=1024;      // Size of block sum
   int mblock;         // Number of blocks (msamp/msum)
 
   // CUDA
@@ -447,8 +447,9 @@ int main(int argc,char *argv[])
       // Perform complex multiplication of FFT'ed data with chirp
       blocksize.x=32; blocksize.y=32; blocksize.z=1;
       gridsize.x=nbin*nsub/blocksize.x+1; gridsize.y=nfft/blocksize.y+1; gridsize.z=1;
-      PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1p,dc,cp1,nbin*nsub,nfft,idm,1.0/(float) nbin);
-      PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2p,dc,cp2,nbin*nsub,nfft,idm,1.0/(float) nbin);
+      // (Removed scaling by 1/nbin to fix digitisation bug)
+      PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp1p,dc,cp1,nbin*nsub,nfft,idm,1.0);
+      PointwiseComplexMultiply<<<gridsize,blocksize>>>(cp2p,dc,cp2,nbin*nsub,nfft,idm,1.0);
 
       // Padd the next iteration
       if (idm==ndm-1) {
@@ -475,7 +476,7 @@ int main(int argc,char *argv[])
       blocksize.x=32; blocksize.y=32; blocksize.z=1;
       gridsize.x=mchan/blocksize.x+1; gridsize.y=mblock/blocksize.y+1; gridsize.z=1;
       compute_block_sums<<<gridsize,blocksize>>>(dfbuf,mchan,mblock,msum,bs1,bs2);
-      
+
       // Compute channel stats
       blocksize.x=32; blocksize.y=1; blocksize.z=1;
       gridsize.x=mchan/blocksize.x+1; gridsize.y=1; gridsize.z=1;
@@ -556,7 +557,7 @@ void usage()
   printf("  -f <FFTs per op>        Number of FFTs per cuFFT call (default: 128)\n");
   printf("  -s <nsub>               Number of input subbands (default: 24)\n");
   printf("  -c <nchan>              Channelisation factor (default: 128)\n");
-  printf("  -m <msum>               Size of blocksum (default: 1920)\n");
+  printf("  -m <msum>               Size of blocksum (default: 1024)\n");
   printf("  -o <output prefix>      Output filename prefix (default: cdmt)\n");
   printf("  -p <source name>        Source name (default: from .hdr file)\n");
   return;
@@ -664,10 +665,10 @@ __global__ void unpack_and_padd(char *dbuf,int nsamp,int nbin,int nfft,int nsub,
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
       idx2=4*nsamp*isub+4*(isamp-noverlap);
 
-      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
-      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
-      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
-      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
+      cp1[idx1].x=((float)(uint8_t) dbuf[idx2]  ) - 128.0;
+      cp1[idx1].y=((float)(uint8_t) dbuf[idx2+1]) - 128.0;
+      cp2[idx1].x=((float)(uint8_t) dbuf[idx2+2]) - 128.0;
+      cp2[idx1].y=((float)(uint8_t) dbuf[idx2+3]) - 128.0;
     }
   }
 
@@ -697,18 +698,18 @@ __global__ void unpack_and_padd_first_iteration(char *dbuf,int nsamp,int nbin,in
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
       idx2=4*nsamp*isub+4*(isamp-noverlap);
 
-      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
-      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
-      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
-      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
+      cp1[idx1].x=((float)(uint8_t) dbuf[idx2]  ) - 128.0;
+      cp1[idx1].y=((float)(uint8_t) dbuf[idx2+1]) - 128.0;
+      cp2[idx1].x=((float)(uint8_t) dbuf[idx2+2]) - 128.0;
+      cp2[idx1].y=((float)(uint8_t) dbuf[idx2+3]) - 128.0;
     } else if (isamp > -noverlap) {
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
       idx2=4*nsamp*isub+4*(noverlap-isamp);
 
-      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
-      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
-      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
-      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
+      cp1[idx1].x=((float)(uint8_t) dbuf[idx2]  ) - 128.0;
+      cp1[idx1].y=((float)(uint8_t) dbuf[idx2+1]) - 128.0;
+      cp2[idx1].x=((float)(uint8_t) dbuf[idx2+2]) - 128.0;
+      cp2[idx1].y=((float)(uint8_t) dbuf[idx2+3]) - 128.0;
     }
   }
 
@@ -740,10 +741,10 @@ __global__ void padd_next_iteration(char *dbuf,int nsamp,int nbin,int nfft,int n
       idx1=ibin+nbin*isub+nsub*nbin*ifft;
       idx2=4*nsamp*isub+4*(isamp+nsamp-2*noverlap);
 
-      cp1[idx1].x=(((float)(uint8_t) dbuf[idx2])  )/256.0;
-      cp1[idx1].y=(((float)(uint8_t) dbuf[idx2+1]))/256.0;
-      cp2[idx1].x=(((float)(uint8_t) dbuf[idx2+2]))/256.0;
-      cp2[idx1].y=(((float)(uint8_t) dbuf[idx2+3]))/256.0;
+      cp1[idx1].x=((float)(uint8_t) dbuf[idx2]  ) - 128.0;
+      cp1[idx1].y=((float)(uint8_t) dbuf[idx2+1]) - 128.0;
+      cp2[idx1].x=((float)(uint8_t) dbuf[idx2+2]) - 128.0;
+      cp2[idx1].y=((float)(uint8_t) dbuf[idx2+3]) - 128.0;
     }
   }
 }
@@ -808,7 +809,7 @@ __global__ void transpose_unpadd_and_detect(cufftComplex *cp1,cufftComplex *cp2,
       
       // Select data points from valid region
       if (ibin>=noverlap && ibin<=nbin-noverlap && isamp>=0 && isamp<nsamp)
-	fbuf[idx2]=cp1[idx1].x*cp1[idx1].x+cp1[idx1].y*cp1[idx1].y+cp2[idx1].x*cp2[idx1].x+cp2[idx1].y*cp2[idx1].y;
+	      fbuf[idx2]=cp1[idx1].x*cp1[idx1].x+cp1[idx1].y*cp1[idx1].y+cp2[idx1].x*cp2[idx1].x+cp2[idx1].y*cp2[idx1].y;
     }
   }
 
