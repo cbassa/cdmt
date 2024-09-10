@@ -376,7 +376,7 @@ int main(int argc,char *argv[])
   // Format file names and open
   output_files=(FILE **) malloc(sizeof(FILE *)*ndm);
   for (idm=0;idm<ndm;idm++) {
-    sprintf(fname,"%s_cDM%07.3f.fil",obsid,dm[idm]);
+    sprintf(fname,"%s_cdm%07.3f.fil",obsid,dm[idm]);
 
     output_files[idm]=fopen(fname,"w");
     if (output_files[idm]==NULL) {
