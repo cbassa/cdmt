@@ -11,6 +11,7 @@
 #include <helper_cuda.h>
 #include <getopt.h>
 #include <hdf5.h>
+#include <limits.h>
 
 #define HEADERSIZE 4096
 #define DMCONSTANT 2.41e-10
@@ -18,7 +19,7 @@
 // Struct for header information
 struct header {
   int64_t headersize,buffersize;
-  unsigned int nchan,nsamp,nbit,nif,nsub;
+  unsigned int nchan,nsamp,nbit=8,nif,nsub;
   int machine_id,telescope_id,nbeam,ibeam,sumif;
   double tstart,tsamp,fch1,foff,fcen,bwchan;
   double src_raj,src_dej,az_start,za_start;
@@ -44,7 +45,7 @@ void write_filterbank_header(struct header h,FILE *file);
 // Usage
 void usage()
 {
-  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -b <ndec> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
+  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -b <ndec> -N <forward FFT size> -n <overlap region> -r <time steps to process> -s <time steps to skip> -o <outputname> <file.h5>\n\n");
   printf("Compute coherently dedispersed SIGPROC filterbank files from LOFAR complex voltage data in HDF5 format.\n");
   printf("-P <part>        Specify part number for input file [integer, default: 0]\n");
   printf("-D <GPU device>  Select GPU device [integer, default: 0]\n");
@@ -53,7 +54,8 @@ void usage()
   printf("-o <outputname>           Output filename [default: cdmt]\n");
   printf("-N <forward FFT size>     Forward FFT size [integer, default: 65536]\n");
   printf("-n <overlap region>       Overlap region [integer, default: 2048]\n");
-
+  printf("-s <bytes>       Number of time samples to skip in the filterbank before stating processing [integer, default: 0]\n");
+  printf("-r <bytes>       Number of time samples to read in total from the -s offset [integer, default: length of file]\n");
   return;
 }
 
@@ -75,15 +77,18 @@ int main(int argc,char *argv[])
   float *dm,*ddm,dm_start,dm_step;
   char fname[128],fheader[1024],*h5fname,obsid[128]="cdmt";
   int bytes_read;
+  long int ts_read=LONG_MAX,ts_skip=0;
+  long int total_ts_read=0,bytes_skip=0;
   int part=0,device=0;
   int arg=0;
   FILE **outfile;
+  double timeInSeconds;
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"P:d:D:ho:b:N:n:"))!=-1) {
+    while ((arg=getopt(argc,argv,"P:d:D:ho:b:N:n:r:s:"))!=-1) {
       switch (arg) {
-	
+
       case 'n':
 	noverlap=atoi(optarg);
 	break;
@@ -99,7 +104,7 @@ int main(int argc,char *argv[])
       case 'o':
 	strcpy(obsid,optarg);
 	break;
-	
+
       case 'P':
 	part=atoi(optarg);
 	break;
@@ -107,9 +112,17 @@ int main(int argc,char *argv[])
       case 'D':
 	device=atoi(optarg);
 	break;
-	
+
       case 'd':
 	sscanf(optarg,"%f,%f,%d",&dm_start,&dm_step,&ndm);
+	break;
+
+      case 's':
+	ts_skip=atol(optarg);
+	break;
+
+      case 'r':
+	ts_read=atol(optarg);
 	break;
 
       case 'h':
@@ -127,9 +140,19 @@ int main(int argc,char *argv[])
   // Read HDF5 header
   h5=read_h5_header(h5fname);
 
+  // Handle skip flag
+  if (ts_skip > 0) {
+  	// If it's not initialised by default...
+  	if (h5.nbit == 0) h5.nbit = 8;
+
+  	bytes_skip = (long int) (ts_skip * (float) h5.nsub * (float) h5.nbit / 8.0);
+  	// Account for the difference in time in the new header if we skip bytes    // tstart = MJD, tsamp = seconds, 1 byte = 8 bits = 1 sample per file by default
+  	h5.tstart += (double) ts_skip * h5.tsamp / 86400.0;
+  }
 
   // Set number of subbands
   nsub=h5.nsub;
+  double timeOffset = h5.tsamp / nsub;
 
   // Adjust header for filterbank format
   h5.tsamp*=nchan*ndec;
@@ -231,6 +254,10 @@ int main(int argc,char *argv[])
   // Read files
   for (i=0;i<4;i++) {
     rawfile[i]=fopen(h5.rawfname[i],"r");
+    if (bytes_skip > 0) {
+  fseek(rawfile[i],bytes_skip,SEEK_SET);
+  printf("Skipping to timestep %ld (byte %ld ftell %ld)\n", ts_skip, bytes_skip, ftell(rawfile[i]));
+    }
   }
 
   // Loop over input file contents
@@ -243,6 +270,9 @@ int main(int argc,char *argv[])
       printf("No data read from last file; assuming EOF, finishng up.\n");
       break;
     }
+
+    // Count up the total bytes read
+    total_ts_read += nread;
     printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     // Copy buffers to device
@@ -312,6 +342,11 @@ int main(int argc,char *argv[])
       fwrite(cbuf,sizeof(char),nread*nsub/ndec,outfile[idm]);
     }
     printf("Processed %d DMs in %.2f s\n",ndm,(float) (clock()-startclock)/CLOCKS_PER_SEC);
+    timeInSeconds = (double) ftell(rawfile[0]) * timeOffset;
+    printf("Current file position: %02ld:%02ld:%05.2lf (%1.2lfs)\n\n", (long int) (timeInSeconds / 3600.0), (long int) ((fmod(timeInSeconds, 3600.0)) / 60.0), fmod(timeInSeconds, 60.0), timeInSeconds);
+    // Exit when we pass the read length limit
+    if (total_ts_read > ts_read)
+      break;
   }
 
   // Close files
