@@ -73,7 +73,7 @@ int main(int argc,char *argv[])
   struct header h5;
   clock_t startclock;
   float *dm,*ddm,dm_start,dm_step;
-  char fname[128],fheader[1024],*h5fname,obsid[128]="cdmt";
+  char fname[512],fheader[1024],*h5fname,obsid[512]="cdmt";
   int bytes_read;
   int part=0,device=0;
   int arg=0;
@@ -243,7 +243,7 @@ int main(int argc,char *argv[])
       printf("No data read from last file; assuming EOF, finishng up.\n");
       break;
     }
-    printf("Block: %d: Read %d MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
+    printf("Block: %d: Read %zu MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
 
     // Copy buffers to device
     startclock=clock();
