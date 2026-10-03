@@ -44,11 +44,11 @@ void write_filterbank_header(struct header h,FILE *file);
 // Usage
 void usage()
 {
-  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -f <nchan> -b <ndec> -B <chunksize> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
+  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -F <nchan> -b <ndec> -B <chunksize> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
   printf("Compute coherently dedispersed SIGPROC filterbank files from LOFAR complex voltage data in HDF5 format.\n");
   printf("-P <part>                 Specify part number for input file [integer, default: 0]\n");
   printf("-D <GPU device>           Select GPU device [integer, default: 0]\n");
-  printf("-f <nchan>                Number of channels per subband [integer, default: 8]\n");
+  printf("-F <nchan>                Number of channels per subband [integer, default: 8]\n");
   printf("-b <ndec>                 Number of time samples to average [integer, default: 1]\n");
   printf("-B <chunksize>            Number of chunks to proc FFT sizes to process per step [integer, default: 100]\n");
   printf("-d <DM start, step, num>  DM start and stepsize, number of DM trials\n");
@@ -250,7 +250,7 @@ int main(int argc,char *argv[])
     for (i=0;i<4;i++)
       nread=fread(h5buf[i],sizeof(char),nsamp*nsub,rawfile[i])/nsub;
     if (nread==0) {
-      printf("No data read from last file; assuming EOF, finishng up.\n");
+      printf("No data read from last file; assuming EOF, finishing up.\n");
       break;
     }
     printf("Block: %d: Read %zu MB in %.2f s\n",iblock,sizeof(char)*nread*nsub*4/(1<<20),(float) (clock()-startclock)/CLOCKS_PER_SEC);
