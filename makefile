@@ -1,8 +1,9 @@
 # CUDA PATH
 CUDAPATH = /opt/cuda
+CUDASAMPLES = /opt/cuda-samples/Common
 
 # Compiling flags
-CFLAGS = -I$(CUDAPATH)/samples/common/inc
+CFLAGS = -I$(CUDASAMPLES)
 
 # Linking flags
 LFLAGS = -lm -L$(CUDAPATH)/lib64 -lcufft -lhdf5 -lcurand
