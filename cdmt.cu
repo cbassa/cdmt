@@ -44,11 +44,13 @@ void write_filterbank_header(struct header h,FILE *file);
 // Usage
 void usage()
 {
-  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -b <ndec> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
+  printf("cdmt -P <part> -d <DM start,step,num> -D <GPU device> -f <nchan> -b <ndec> -B <chunksize> -N <forward FFT size> -n <overlap region> -o <outputname> <file.h5>\n\n");
   printf("Compute coherently dedispersed SIGPROC filterbank files from LOFAR complex voltage data in HDF5 format.\n");
-  printf("-P <part>        Specify part number for input file [integer, default: 0]\n");
-  printf("-D <GPU device>  Select GPU device [integer, default: 0]\n");
-  printf("-b <ndec>        Number of time samples to average [integer, default: 1]\n");
+  printf("-P <part>                 Specify part number for input file [integer, default: 0]\n");
+  printf("-D <GPU device>           Select GPU device [integer, default: 0]\n");
+  printf("-f <nchan>                Number of channels per subband [integer, default: 8]\n");
+  printf("-b <ndec>                 Number of time samples to average [integer, default: 1]\n");
+  printf("-B <chunksize>            Number of chunks to proc FFT sizes to process per step [integer, default: 100]\n");
   printf("-d <DM start, step, num>  DM start and stepsize, number of DM trials\n");
   printf("-o <outputname>           Output filename [default: cdmt]\n");
   printf("-N <forward FFT size>     Forward FFT size [integer, default: 65536]\n");
@@ -59,7 +61,7 @@ void usage()
 
 int main(int argc,char *argv[])
 {
-  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm,ndec=1;
+  int i,nsamp,nfft,mbin,nvalid,nchan=8,nbin=65536,noverlap=2048,nsub=20,ndm,ndec=1,chunksize=100;
   int idm,iblock,nread,mchan,msamp,mblock,msum=1024;
   char *header,*h5buf[4],*dh5buf[4];
   FILE *rawfile[4],*file;
@@ -81,7 +83,7 @@ int main(int argc,char *argv[])
 
   // Read options
   if (argc>1) {
-    while ((arg=getopt(argc,argv,"P:d:D:ho:b:N:n:"))!=-1) {
+    while ((arg=getopt(argc,argv,"P:d:D:ho:b:N:n:F:B:"))!=-1) {
       switch (arg) {
 	
       case 'n':
@@ -95,6 +97,10 @@ int main(int argc,char *argv[])
       case 'b':
 	ndec=atoi(optarg);
 	break;
+
+      case 'F':
+	nchan=atoi(optarg);
+        break;
 
       case 'o':
 	strcpy(obsid,optarg);
@@ -112,8 +118,12 @@ int main(int argc,char *argv[])
 	sscanf(optarg,"%f,%f,%d",&dm_start,&dm_step,&ndm);
 	break;
 
+      case 'B':
+	chunksize=atoi(optarg);
+        break;
+
       case 'h':
-	usage();
+     	usage();
 	return 0;
       }
     }
@@ -140,7 +150,7 @@ int main(int argc,char *argv[])
 
   // Data size
   nvalid=nbin-2*noverlap;
-  nsamp=100*nvalid;
+  nsamp=chunksize*nvalid;
   nfft=(int) ceil(nsamp/(float) nvalid);
   mbin=nbin/nchan;
   mchan=nsub*nchan;
